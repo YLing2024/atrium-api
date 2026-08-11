@@ -8,6 +8,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 const CONFIG_PATH = process.env.ADMIN_CONFIG_PATH || path.join(__dirname, '..', 'config.json');
 
@@ -51,6 +52,17 @@ module.exports = {
   setAdminPassword(password) {
     config.admin_password = password;
     save();
+  },
+  setTotpSecret(secret) {
+    config.totp_secret = secret;
+    save();
+  },
+  getOrCreateJwtSecret() {
+    if (!config.jwt_secret) {
+      config.jwt_secret = crypto.randomBytes(32).toString('hex');
+      save();
+    }
+    return config.jwt_secret;
   },
   CONFIG_PATH
 };

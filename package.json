@@ -12,6 +12,7 @@
     "express": "^4.19.2",
     "ioredis": "^5.4.1",
     "multer": "^1.4.5-lts.1",
+    "totp-auth": "file:../totp-auth",
     "ws": "^8.18.0"
   }
 }

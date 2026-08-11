@@ -17,6 +17,7 @@ const net = require('net');
 const Redis = require('ioredis');
 const multer = require('multer');
 const { WebSocketServer, WebSocket } = require('ws');
+const { createTotpAuth } = require('totp-auth');
 const config = require('./config');
 
 const PORT = parseInt(process.env.PORT, 10) || 3100;
@@ -33,13 +34,37 @@ function sessionKey(token) {
   return SESSION_KEY_PREFIX + token;
 }
 
-// 登录失败锁定：按 IP 计数，5 次失败锁 15 分钟（TTL 900），锁定期登录返回 429
-const LOGIN_FAIL_PREFIX = 'admin:login_fail:';
+// 登录失败锁定：内存 Map 按 IP 计数，连续失败 5 次锁 60 秒，锁定期登录返回 429
 const LOGIN_MAX_FAILS = 5;
-const LOGIN_LOCK_TTL = 900;
+const LOGIN_LOCK_SECONDS = 60;
+const loginFails = new Map(); // ip -> { count, lockUntil }
 
-function loginFailKey(ip) {
-  return LOGIN_FAIL_PREFIX + ip;
+// 检查是否处于锁定状态；锁定过期则顺手清理，返回 { locked, remain? }
+function loginRateCheck(ip) {
+  const rec = loginFails.get(ip);
+  if (rec && rec.lockUntil) {
+    if (rec.lockUntil > Date.now()) {
+      return { locked: true, remain: Math.ceil((rec.lockUntil - Date.now()) / 1000) };
+    }
+    loginFails.delete(ip);
+  }
+  return { locked: false };
+}
+
+// 记录一次失败；累计到上限即触发 60s 锁定，返回当前失败计数
+function loginRateFail(ip) {
+  const rec = loginFails.get(ip) || { count: 0, lockUntil: 0 };
+  rec.count += 1;
+  if (rec.count >= LOGIN_MAX_FAILS) {
+    rec.lockUntil = Date.now() + LOGIN_LOCK_SECONDS * 1000;
+  }
+  loginFails.set(ip, rec);
+  return rec;
+}
+
+// 登录成功清除该 IP 失败记录
+function loginRateClear(ip) {
+  loginFails.delete(ip);
 }
 
 // 审计日志：JSON 行追加写 /root/proj/admin-server/audit.log，写入失败不影响业务
@@ -104,9 +129,48 @@ function verifyPassword(input, stored) {
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
-// Redis 单例会话鉴权中间件。支持 Authorization: Bearer <token>，也支持 query ?token=
-// （query 形式主要为了 <img src> 等无法携带 Header 的场景）
+/* ============ TOTP 鉴权（独立模块 totp-auth） ============ */
+
+// TOTP secret 持久化文件（可被 ADMIN_TOTP_SECRET_FILE 覆盖，测试实例独立隔离）
+const TOTP_SECRET_FILE =
+  process.env.ADMIN_TOTP_SECRET_FILE || path.join(__dirname, '..', 'totp-secret.json');
+
+// 复用独立模块：TOTP 动态码验证 + JWT + 按 IP 阶梯限速 + secret 文件持久化
+const auth = createTotpAuth({
+  secretFile: TOTP_SECRET_FILE,
+  issuer: 'HomeAdmin',
+  jwtSecret: config.getOrCreateJwtSecret(),
+  jwtExpiresIn: '12h',
+  rateLimit: { maxFailures: 5, lockout: [60, 300, 900] },
+});
+
+// 认证中心地址：WS 鉴权与 SSO 兼容接口共用
+const AUTH_CENTER_VERIFY_URL =
+  process.env.AUTH_CENTER_VERIFY_URL || 'http://127.0.0.1:3200/api/verify';
+
+// 调认证中心内部接口验证 token，返回是否通过
+async function verifyAuthCenterToken(token) {
+  try {
+    const res = await fetch(
+      `${AUTH_CENTER_VERIFY_URL}?token=${encodeURIComponent(token)}`,
+      { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(3000) }
+    );
+    return res.ok;
+  } catch (e) {
+    return false;
+  }
+}
+
+// 鉴权中间件：
+//  主鉴权 —— 信任 Nginx 探针注入的 X-Auth-User header（认证中心已验证，内网可信），
+//  存在且非空即通过，req.user 设为其值；
+//  降级 —— header 缺失时回退旧 Redis 会话校验（过渡期兼容，支持 Bearer 与 query token）
 async function authRequired(req, res, next) {
+  const xAuthUser = req.get('x-auth-user');
+  if (xAuthUser && String(xAuthUser).trim()) {
+    req.user = { role: 'admin', name: String(xAuthUser).trim() };
+    return next();
+  }
   const header = req.headers.authorization || '';
   const headerToken = header.startsWith('Bearer ') ? header.slice(7).trim() : null;
   const queryToken = req.query && req.query.token ? String(req.query.token) : null;
@@ -550,31 +614,36 @@ app.get('/', (req, res) => {
   res.json({ name: 'admin-server', status: 'ok' });
 });
 
-// 登录：密码比对成功后写入 Redis 独立会话（12h 过期，key 带 token 后缀，多端共存）
-// 除 config.json 的 admin_password 外，若设置了环境变量 ADMIN_TEST_PASSWORD（仅测试环境注入，
-// 生产 systemd 不设置），输入该值同样允许登录，签发正常会话 token
+// 登录：TOTP 动态验证码比对（复用 totp-auth 模块的 verifyCode），成功后写入 Redis 独立会话
 app.post('/api/admin/login', async (req, res) => {
-  const { password } = req.body || {};
+  const { code } = req.body || {};
   const ip = clientIp(req);
-  const failKey = loginFailKey(ip);
   try {
-    // 锁定检查：失败次数已达上限（TTL 内），直接 429 拒绝，不再比对密码
-    const fails = parseInt(await redis.get(failKey), 10) || 0;
-    if (fails >= LOGIN_MAX_FAILS) {
-      auditLog('login', ip, false, `锁定中（已失败 ${fails} 次）`);
-      return res.status(429).json({ error: '尝试过多，请稍后再试' });
+    // 首次使用：secret 未配置时引导先设置
+    const secret = auth.getSecret();
+    if (!secret) {
+      auditLog('login', ip, false, 'TOTP 未配置');
+      return res
+        .status(403)
+        .json({ error: '首次使用：请先设置 TOTP', code: 'totp_setup_required' });
     }
-    const testPwd = process.env.ADMIN_TEST_PASSWORD;
-    const testOk =
-      !!testPwd && verifyPassword(password, testPwd);
-    if (!password || (!verifyPassword(password, config.get().admin_password) && !testOk)) {
-      const next = await redis.incr(failKey);
-      await redis.expire(failKey, LOGIN_LOCK_TTL); // 每次失败都刷新 15 分钟窗口
-      auditLog('login', ip, false, `密码错误（第 ${next}/${LOGIN_MAX_FAILS} 次）`);
-      return res.status(401).json({ error: '密码错误' });
+    // 锁定检查：同一 IP 连续失败已达上限（60s 锁定内），直接 429 拒绝
+    const rate = loginRateCheck(ip);
+    if (rate.locked) {
+      auditLog('login', ip, false, `锁定中（剩余 ${rate.remain}s）`);
+      return res.status(429).json({
+        error: `尝试过多，请 ${rate.remain} 秒后再试`,
+        code: 'rate_limited',
+        retryAfter: rate.remain
+      });
+    }
+    if (!auth.verifyCode(secret, code)) {
+      const rec = loginRateFail(ip);
+      auditLog('login', ip, false, `验证码错误（第 ${rec.count}/${LOGIN_MAX_FAILS} 次）`);
+      return res.status(401).json({ error: '验证码错误' });
     }
     // 登录成功：清除该 IP 失败计数，签发会话
-    await redis.del(failKey);
+    loginRateClear(ip);
     auditLog('login', ip, true, 'ok');
     const token = crypto.randomBytes(32).toString('hex');
     await redis.set(sessionKey(token), token, 'EX', SESSION_TTL);
@@ -584,6 +653,54 @@ app.post('/api/admin/login', async (req, res) => {
     res.status(500).json({ error: '会话服务异常' });
   }
 });
+
+// SSO 验证（无鉴权，保留兼容：认证中心签发 token → 建立本地 Redis 会话）。
+// 新前端不再调用（直接信任认证中心 token），此处仅服务过渡期/旧客户端。
+app.post('/api/admin/sso/verify', async (req, res) => {
+  const { token } = req.body || {};
+  const ip = clientIp(req);
+  if (typeof token !== 'string' || !token) {
+    auditLog('sso_verify', ip, false, '缺少 token');
+    return res.status(400).json({ error: '缺少 token' });
+  }
+  let verifyRes;
+  try {
+    verifyRes = await fetch(
+      `${AUTH_CENTER_VERIFY_URL}?token=${encodeURIComponent(token)}`,
+      { headers: { Accept: 'application/json' } }
+    );
+  } catch (e) {
+    auditLog('sso_verify', ip, false, '认证中心不可达: ' + e.message);
+    return res.status(502).json({ error: '认证中心不可达' });
+  }
+  if (!verifyRes.ok) {
+    auditLog('sso_verify', ip, false, '认证中心拒绝验证');
+    return res.status(401).json({ error: '认证中心 token 无效' });
+  }
+  try {
+    // 认证通过：复用现有 session 创建逻辑，签发本地 Redis 会话
+    const localToken = crypto.randomBytes(32).toString('hex');
+    await redis.set(sessionKey(localToken), localToken, 'EX', SESSION_TTL);
+    auditLog('sso_verify', ip, true, 'ok');
+    res.json({ token: localToken });
+  } catch (e) {
+    auditLog('sso_verify', ip, false, '会话服务异常');
+    res.status(500).json({ error: '会话服务异常' });
+  }
+});
+
+// TOTP 设置 / 重置：挂载 totp-auth 模块路由
+//  POST /api/admin/totp/setup —— 首次设置（无鉴权，secret 已配置则 409）
+//  POST /api/admin/totp/reset —— 重置（需 Bearer JWT）
+app.use('/api/admin/totp', (req, res, next) => {
+  const ip = clientIp(req);
+  res.on('finish', () => {
+    if (req.path === '/setup' || req.path === '/reset') {
+      auditLog('totp_' + req.path.slice(1), ip, res.statusCode < 400, 'ok');
+    }
+  });
+  next();
+}, auth.router);
 
 // 系统信息（需鉴权）。每次请求实时采集，无缓存
 app.get('/api/admin/system', authRequired, async (req, res) => {
@@ -604,6 +721,42 @@ app.get('/api/admin/system', authRequired, async (req, res) => {
 // 历史采样（需鉴权）。返回环形 buffer 中的采样点（最多 120 点），多实例共享
 app.get('/api/admin/system/history', authRequired, (req, res) => {
   res.json(readHistory());
+});
+
+// 软件版本监控（需鉴权）：采集所有关键软件/服务版本
+const NODE_BIN = '/root/.nvm/versions/node/v24.19.0/bin';
+const VERSION_CHECKS = [
+  { name: 'Node.js', category: 'runtime', cmd: `${NODE_BIN}/node --version` },
+  { name: 'npm', category: 'runtime', cmd: `PATH=${NODE_BIN}:$PATH ${NODE_BIN}/npm --version` },
+  { name: 'Python', category: 'runtime', cmd: 'python3 --version' },
+  { name: 'nginx', category: 'runtime', cmd: 'nginx -v 2>&1' },
+  { name: 'Redis', category: 'runtime', cmd: 'redis-server --version' },
+  { name: 'Hermes', category: 'service', cmd: '/usr/local/bin/hermes --version' },
+  { name: 'Cloudreve', category: 'service', cmd: "curl -s --max-time 3 http://127.0.0.1:5212/api/v4/site/ping | python3 -c \"import json,sys; print('v'+json.load(sys.stdin)['data'])\"" },
+  { name: 'Alist', category: 'service', cmd: '/root/proj/alist/alist version' },
+  { name: 'DeepTutor', category: 'service', cmd: '/root/proj/deeptutor/.venv/bin/pip show deeptutor | grep -m1 Version' },
+  { name: '系统内核', category: 'system', cmd: 'uname -r' },
+  { name: '操作系统', category: 'system', cmd: 'cat /etc/os-release | grep PRETTY_NAME | cut -d\\" -f2' },
+];
+
+app.get('/api/admin/versions', authRequired, async (req, res) => {
+  const results = [];
+  for (const v of VERSION_CHECKS) {
+    try {
+      const out = execSync(v.cmd, { encoding: 'utf-8', timeout: 8000 })
+        .trim()
+        .split('\n')[0];
+      results.push({ name: v.name, category: v.category, version: out || '未知', ok: true });
+    } catch (e) {
+      results.push({
+        name: v.name,
+        category: v.category,
+        version: String(e.stderr || e.message || '').trim().split('\n')[0] || '不可用',
+        ok: false,
+      });
+    }
+  }
+  res.json({ list: results });
 });
 
 // 服务状态（需鉴权）。返回各服务 [{ name, status: up/down, pid? }]
@@ -744,22 +897,26 @@ function extractToken(req) {
 }
 
 wss.on('connection', async (ws, req) => {
-  // 1. 校验客户端 Redis 会话 token
+  // 1. 鉴权：优先用 query token 调认证中心 /api/verify 验证（通过即连接）；
+  //    失败（token 非认证中心签发/认证中心不可达）降级回旧 Redis 会话校验，兼容过渡期
   const token = extractToken(req);
   if (!token) {
     ws.close(4001, 'missing token');
     return;
   }
-  try {
-    const stored = await redis.get(sessionKey(token));
-    if (!stored || stored !== token) {
-      ws.close(4001, 'invalid token');
+  const authOk = await verifyAuthCenterToken(token);
+  if (!authOk) {
+    try {
+      const stored = await redis.get(sessionKey(token));
+      if (!stored || stored !== token) {
+        ws.close(4001, 'invalid token');
+        return;
+      }
+      await redis.expire(sessionKey(token), SESSION_TTL); // 滑动续期
+    } catch (e) {
+      ws.close(4001, 'redis error');
       return;
     }
-    await redis.expire(sessionKey(token), SESSION_TTL); // 滑动续期
-  } catch (e) {
-    ws.close(4001, 'redis error');
-    return;
   }
 
   // 2. 读取 Hermes 令牌并连接网关
@@ -893,5 +1050,5 @@ server.listen(PORT, HOST, () => {
   console.log(`[admin-server] 已启动，监听地址: ${HOST}:${PORT}`);
   console.log(`[admin-server] 上传目录: ${UPLOAD_DIR}`);
   console.log(`[admin-server] 配置文件: ${config.CONFIG_PATH}`);
-  console.log(`[admin-server] 提示: 初始密码见 config.json 中的 admin_password 字段`);
+  console.log(`[admin-server] 提示: 登录使用 TOTP 动态验证码，secret 见 config.json 的 totp_secret 字段`);
 });
