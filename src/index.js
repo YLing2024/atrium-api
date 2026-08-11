@@ -781,35 +781,51 @@ const VERSION_CHECKS = [
   { name: 'Hermes', category: 'service', cmd: "/usr/local/bin/hermes version 2>/dev/null | head -1 | grep -oE 'v[0-9.]+' | head -1 | sed 's/^v//'" },
   // opencode 当前版本直接读 package.json（opencode --version 需 4.5s，cat 毫秒级）
   { name: 'OpenCode', category: 'service', cmd: "cat /root/.nvm/versions/node/v24.19.0/lib/node_modules/opencode-ai/package.json | grep -m1 '\"version\"' | grep -oE '[0-9]+\\.[0-9]+\\.[0-9]+'" },
+  // playwright cli 为 #!/usr/bin/env node，需带 PATH 前缀才能在 systemd 精简环境跑通；
+  // --version 输出形如 'Version 1.62.1'，提取裸版本号与其他条目格式一致
+  { name: 'Playwright', category: 'service', cmd: "PATH=/root/.nvm/versions/node/v24.19.0/bin:$PATH /root/.nvm/versions/node/v24.19.0/bin/playwright --version | grep -oE '[0-9]+\\.[0-9]+\\.[0-9]+' | head -1" },
   { name: 'dida-cli', category: 'service', cmd: "cat /root/.nvm/versions/node/v24.19.0/lib/node_modules/@suibiji/dida-cli/package.json | grep -m1 \"version\" | grep -oE '[0-9]+\\.[0-9]+\\.[0-9]+'" },
   { name: 'Cloudreve', category: 'service', cmd: "curl -s --max-time 3 http://127.0.0.1:5212/api/v4/site/ping | python3 -c \"import json,sys; print('v'+json.load(sys.stdin)['data'])\"" },
   { name: 'Alist', category: 'service', cmd: "/root/proj/alist/alist version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1 | sed 's/^v//'" },
   { name: 'DeepTutor', category: 'service', cmd: '/root/proj/deeptutor/.venv/bin/pip show deeptutor | grep -m1 Version | awk \'{print $2}\'' },
 ];
 
-// 版本列表（需鉴权）：并行执行所有本地当前版本命令（Promise.allSettled，
-// 单条失败不影响其余），结果统一过 stripVersion 清洗（去 v 前缀、去 epoch、取 '-' 前主版本段）
+// 版本结果缓存：1 秒轮询若每次都执行 VERSION_CHECKS 会堆积重命令进程（如 alist version ~70MB/次），
+// 故缓存 60 秒，命中窗口内直接返回上次结果，不再重复执行命令
+const VERSION_CACHE_TTL_MS = 60000;
+const versionCache = { ts: 0, list: null };
+
+// 并行执行所有本地当前版本命令（Promise.allSettled，单条失败不影响其余），
+// 结果统一过 stripVersion 清洗（去 v 前缀、去 epoch、取 '-' 前主版本段）
+async function getVersions() {
+  const settled = await Promise.allSettled(
+    VERSION_CHECKS.map(async (v) => {
+      const { stdout } = await execAsync(v.cmd, { encoding: 'utf-8', timeout: 8000 });
+      const version = stripVersion(String(stdout).trim().split('\n')[0]) || '未知';
+      return { name: v.name, category: v.category, version, ok: true };
+    })
+  );
+  return settled.map((s, i) =>
+    s.status === 'fulfilled'
+      ? s.value
+      : {
+          name: VERSION_CHECKS[i].name,
+          category: VERSION_CHECKS[i].category,
+          version: '未知',
+          ok: false
+        }
+  );
+}
+
+// 版本列表（需鉴权）：缓存命中（60 秒内）直接返回，否则重新执行命令并写入缓存
 app.get('/api/admin/versions', authRequired, async (req, res) => {
   try {
-    const settled = await Promise.allSettled(
-      VERSION_CHECKS.map(async (v) => {
-        const { stdout } = await execAsync(v.cmd, { encoding: 'utf-8', timeout: 8000 });
-        const version = stripVersion(String(stdout).trim().split('\n')[0]) || '未知';
-        return { name: v.name, category: v.category, version, ok: true };
-      })
-    );
-    res.json({
-      list: settled.map((s, i) =>
-        s.status === 'fulfilled'
-          ? s.value
-          : {
-              name: VERSION_CHECKS[i].name,
-              category: VERSION_CHECKS[i].category,
-              version: '未知',
-              ok: false
-            }
-      )
-    });
+    const now = Date.now();
+    if (!versionCache.list || now - versionCache.ts > VERSION_CACHE_TTL_MS) {
+      versionCache.list = await getVersions();
+      versionCache.ts = now;
+    }
+    res.json({ list: versionCache.list });
   } catch (e) {
     res.status(500).json({ error: '获取软件版本失败: ' + e.message });
   }
