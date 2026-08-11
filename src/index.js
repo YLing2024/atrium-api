@@ -207,27 +207,16 @@ function cpuSample() {
   return { idle, total };
 }
 
-// 通过两次采样计算 CPU 使用率（1s 差分，直接返回本次值，不叠加 EMA 平滑；
-// 1s 窗口已足够稳，避免单核机器上短窗口瞬时尖峰把使用率拉虚高）
-const CPU_EMA_ALPHA = 0.4 // 仅历史趋势采样（sampleHistory）使用
-
+// 系统卡片 CPU = 全部进程瞬时 CPU 合计（进程合计占用，不含内核/IO），与进程排行同一套算法
 function getCpuInfo() {
-  const a = cpuSample();
-  return new Promise((resolve) => {
-    setTimeout(() => {
-      const b = cpuSample();
-      const totalDiff = b.total - a.total;
-      const idleDiff = b.idle - a.idle;
-      const usage = totalDiff > 0 ? ((totalDiff - idleDiff) / totalDiff) * 100 : 0;
-      const cpus = os.cpus();
-      resolve({
-        model: cpus[0] ? cpus[0].model.trim() : 'unknown',
-        usage_percent: Math.round(usage * 100) / 100,
-        cores: cpus.length,
-        loadavg: os.loadavg()
-      });
-    }, 1000); // 采样窗口 1s，与进程瞬时采样口径一致
-  });
+  const cpus = os.cpus();
+  const { totalPct } = collectAllProcCpu();
+  return {
+    model: cpus[0] ? cpus[0].model.trim() : 'unknown',
+    usage_percent: totalPct,
+    cores: cpus.length,
+    loadavg: os.loadavg()
+  };
 }
 
 // 磁盘：取 df -kP 中挂载点为 '/' 的行，仅统计总量，不做目录明细扫描（单位字节）
@@ -362,7 +351,7 @@ async function collectSystem() {
   const free = os.freemem();
   const used = total - free;
   return {
-    cpu: await getCpuInfo(),
+    cpu: getCpuInfo(),
     memory: {
       total,
       used,
@@ -447,6 +436,8 @@ let histCpuPrev = null
 let histCpuEma = null // history CPU 滑动平均;
 let histNetPrev = null;
 let histDiskioPrev = null;
+
+const CPU_EMA_ALPHA = 0.4 // 仅历史趋势采样（sampleHistory）使用
 
 // 内存使用率（百分比，一位小数）
 function memPercent() {
@@ -828,11 +819,13 @@ app.get('/api/admin/versions', authRequired, async (req, res) => {
   }
 });
 
-// 服务状态（需鉴权）。返回各服务 [{ name, status: up/down, pid? }]
+// 服务状态（需鉴权）。返回各服务 [{ name, status: up/down, pid? }]、
+// 进程排行 TOP15 与全部进程瞬时 CPU 合计 total_cpu（与系统卡片同口径）。
+// collectProcesses 内部做单次 /proc 全量遍历，进程 cpu 与 total_cpu 同源同基准
 app.get('/api/admin/services', authRequired, async (req, res) => {
   try {
-    const [services, processes] = await Promise.all([collectServices(), collectProcesses()]);
-    res.json({ services, processes });
+    const [services, result] = await Promise.all([collectServices(), collectProcesses()]);
+    res.json({ services, processes: result.processes, total_cpu: result.total_cpu });
   } catch (e) {
     res.status(500).json({ error: '获取服务状态失败: ' + e.message });
   }
@@ -891,9 +884,56 @@ function procTotalTicks() {
   }
 }
 
+// 单次遍历 /proc/[pid]（仅数字目录），对每个 pid 用 procCpuSample Map 做差分（复用
+// procCpuTicks/procTotalTicks），一次采样同时产出 perPid（各进程瞬时 pct）与 totalPct
+// （全部进程合计），保证两者同源、同差分基准、同窗口——各进程 pct 之和恒等于 totalPct。
+// 首次采样（pid 无上一轮状态）无差值：pct 记为 0（collectProcesses 对不在遍历结果内的
+// pid 再用 ps pcpu 兜底）。返回值 { perPid: Map<pid, pct>, totalPct }。
+function collectAllProcCpu() {
+  const curTotal = procTotalTicks();
+  const perPid = new Map();
+  if (curTotal === null) return { perPid, totalPct: 0 };
+  let names;
+  try {
+    names = fs.readdirSync('/proc');
+  } catch (e) {
+    return { perPid, totalPct: 0 };
+  }
+  let sumTicks = 0;
+  let dTotal = 0;
+  let hasPrev = false;
+  for (const name of names) {
+    if (!/^\d+$/.test(name)) continue; // 仅数字目录（进程 pid）
+    const pid = parseInt(name, 10);
+    const curCpu = procCpuTicks(pid);
+    if (curCpu === null) {
+      procCpuSample.delete(pid); // 进程已退出：清采样缓存
+      continue;
+    }
+    const last = procCpuSample.get(pid);
+    let pct = 0;
+    if (last && curTotal > last.total) {
+      const dCpu = curCpu - last.cpu;
+      if (dCpu >= 0) {
+        sumTicks += dCpu;
+        if (!dTotal) dTotal = curTotal - last.total; // 系统总时间差值，本轮全局一致
+        pct = Math.round((dCpu / dTotal) * 1000) / 10;
+        hasPrev = true;
+      }
+    }
+    procCpuSample.set(pid, { cpu: curCpu, total: curTotal, pct });
+    perPid.set(pid, pct);
+  }
+  if (!hasPrev || dTotal <= 0) return { perPid, totalPct: 0 };
+  return { perPid, totalPct: Math.round((sumTicks / dTotal) * 1000) / 10 };
+}
+
 // 采集 TOP 内存进程（单列进程排行）：ps 按 RSS 降序取前 15。
 // 命名规则：pid 命中 systemd 主进程映射 → 服务名；未命中再按 comm/args 兜底分类
-// （opencode / agent-browser / node / python / 其他 comm）
+// （opencode / agent-browser / node / python / 其他 comm）。
+// CPU 统一走 collectAllProcCpu() 的单次 /proc 全量遍历：各进程 cpu 直接取 perPid.get(pid)，
+// total_cpu 取 totalPct，同一请求内两者同源、同差分基准，不再各自采样。
+// 返回 { processes: [...], total_cpu }。
 async function collectProcesses() {
   // 1. systemd 正规化：逐服务查 MainPID，非 0 则记录 pid→服务名映射
   const pidToService = new Map();
@@ -912,13 +952,15 @@ async function collectProcesses() {
     })
   );
 
+  // 2. 单次遍历 /proc 全部进程差分：perPid 与 totalPct 同源（此后再不单独差分）
+  const { perPid, totalPct } = collectAllProcCpu();
+
   try {
     const out = execSync(
       "ps -eo pid,comm,rss,pcpu,args --sort=-rss | head -16 | tail -15",
       { encoding: 'utf-8' }
     );
-    const curTotal = procTotalTicks(); // 系统总时间，本次采样全局一致
-    return out
+    const processes = out
       .trim()
       .split('\n')
       .map((line) => {
@@ -942,29 +984,11 @@ async function collectProcesses() {
         } else {
           name = comm;
         }
-        // 进程瞬时 CPU：/proc/<pid>/stat 的 utime+stime 与上次差值 ÷ 系统总时间差值
-        const curCpu = procCpuTicks(pid);
-        let cpu;
-        if (curCpu !== null && curTotal !== null) {
-          const last = procCpuSample.get(pid);
-          if (last) {
-            const dTotal = curTotal - last.total;
-            if (dTotal > 0) {
-              cpu = Math.round(((curCpu - last.cpu) / dTotal) * 1000) / 10;
-            } else {
-              // 防除零：total 差值 ≤ 0 时返回上次瞬时值（无则 0）
-              cpu = last.pct != null ? last.pct : 0;
-            }
-          } else {
-            // 上次无采样：用 ps 的 pcpu 兜底
-            cpu = Math.round((parseFloat(m[3]) || 0) * 10) / 10;
-          }
-          procCpuSample.set(pid, { cpu: curCpu, total: curTotal, pct: cpu });
-        } else {
-          // 进程不存在（/proc/pid 读失败）：删除采样缓存，pcpu 兜底
-          procCpuSample.delete(pid);
-          cpu = Math.round((parseFloat(m[3]) || 0) * 10) / 10;
-        }
+        // 进程瞬时 CPU：直接用本轮 collectAllProcCpu 的 perPid（与 total_cpu 同一次遍历、
+        // 同一差分基准）；pid 不在遍历结果内（/proc/<pid>/stat 读取失败的极端情况）用 ps pcpu 兜底
+        const pct = perPid.get(pid);
+        const cpu =
+          pct != null ? pct : Math.round((parseFloat(m[3]) || 0) * 10) / 10;
         return {
           name,
           pid,
@@ -973,8 +997,9 @@ async function collectProcesses() {
         };
       })
       .filter(Boolean);
+    return { processes, total_cpu: totalPct };
   } catch {
-    return [];
+    return { processes: [], total_cpu: totalPct };
   }
 }
 
