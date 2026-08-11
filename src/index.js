@@ -207,10 +207,9 @@ function cpuSample() {
   return { idle, total };
 }
 
-// 通过两次采样计算 CPU 使用率
-// CPU 采样滑动平均（EMA）：抹平单核机器上 150ms 瞬时采样的 0%/100% 跳变
-let cpuEma = null
-const CPU_EMA_ALPHA = 0.4 // 新采样权重；越大响应越快、平滑越弱
+// 通过两次采样计算 CPU 使用率（1s 差分，直接返回本次值，不叠加 EMA 平滑；
+// 1s 窗口已足够稳，避免单核机器上短窗口瞬时尖峰把使用率拉虚高）
+const CPU_EMA_ALPHA = 0.4 // 仅历史趋势采样（sampleHistory）使用
 
 function getCpuInfo() {
   const a = cpuSample();
@@ -220,16 +219,14 @@ function getCpuInfo() {
       const totalDiff = b.total - a.total;
       const idleDiff = b.idle - a.idle;
       const usage = totalDiff > 0 ? ((totalDiff - idleDiff) / totalDiff) * 100 : 0;
-      // EMA 平滑：cpuEma = cpuEma * (1-α) + usage * α
-      cpuEma = cpuEma === null ? usage : cpuEma * (1 - CPU_EMA_ALPHA) + usage * CPU_EMA_ALPHA;
       const cpus = os.cpus();
       resolve({
         model: cpus[0] ? cpus[0].model.trim() : 'unknown',
-        usage_percent: Math.round(cpuEma * 100) / 100,
+        usage_percent: Math.round(usage * 100) / 100,
         cores: cpus.length,
         loadavg: os.loadavg()
       });
-    }, 300); // 采样窗口 150→300ms，配合 EMA 平滑
+    }, 1000); // 采样窗口 1s，与进程瞬时采样口径一致
   });
 }
 
@@ -359,7 +356,7 @@ function getDiskIoInfo() {
   return info;
 }
 
-// 采集系统信息（CPU 需 ~150ms 双采样）
+// 采集系统信息（CPU 需 ~1s 双采样）
 async function collectSystem() {
   const total = os.totalmem();
   const free = os.freemem();
