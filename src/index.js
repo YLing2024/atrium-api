@@ -132,6 +132,12 @@ function verifyPassword(input, stored) {
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
+// 通用 EMA（指数移动平均）平滑：所有 CPU 值统一走此函数，同参数结果一致。
+// prev 为 null/undefined（首次）时直接取 current，避免冷启动跳变
+function ema(prev, current, alpha) {
+  return prev == null ? current : prev * (1 - alpha) + current * alpha;
+}
+
 /* ============ TOTP 鉴权（独立模块 totp-auth） ============ */
 
 // TOTP secret 持久化文件（可被 ADMIN_TOTP_SECRET_FILE 覆盖，测试实例独立隔离）
@@ -437,7 +443,7 @@ let histCpuEma = null // history CPU 滑动平均;
 let histNetPrev = null;
 let histDiskioPrev = null;
 
-const CPU_EMA_ALPHA = 0.4 // 仅历史趋势采样（sampleHistory）使用
+const CPU_EMA_ALPHA = 0.4; // 统一 EMA 平滑系数：系统卡片 / 进程排行 / 历史趋势全走同一函数同一参数
 
 // 内存使用率（百分比，一位小数）
 function memPercent() {
@@ -459,8 +465,8 @@ function sampleHistory() {
     const totalDiff = cpu.total - histCpuPrev.total;
     const idleDiff = cpu.idle - histCpuPrev.idle;
     const raw = totalDiff > 0 ? ((totalDiff - idleDiff) / totalDiff) * 100 : 0;
-    // history 采样同样走 EMA 平滑，避免趋势图跳变
-    histCpuEma = histCpuEma === null ? raw : histCpuEma * (1 - CPU_EMA_ALPHA) + raw * CPU_EMA_ALPHA;
+    // history 采样同样走统一 EMA 平滑，避免趋势图跳变
+    histCpuEma = ema(histCpuEma, raw, CPU_EMA_ALPHA);
     cpuPercent = Math.round(histCpuEma * 10) / 10;
   }
 
@@ -847,8 +853,12 @@ const SYSTEMD_SERVICES = [
   'hermes-serve'
 ];
 
-// 模块级进程瞬时 CPU 采样状态：pid -> { cpu, total, pct }（上次 /proc 采样值，单位 clock ticks）
+// 模块级进程瞬时 CPU 采样状态：pid -> { cpu, total }（上次 /proc 采样值，单位 clock ticks）
 const procCpuSample = new Map();
+
+// 进程 CPU 与总占用 CPU 的 EMA 平滑状态（pid -> 上次平滑值；totalEmaPrev -> 总占用平滑值）
+const procCpuEma = new Map();
+let totalEmaPrev = null;
 
 // 读 /proc/<pid>/stat，返回进程已用 CPU ticks（utime+stime，字段 14/15）；
 // 进程名可能含空格，取最后一个 ')' 后的字段再按空格分割，字段 3 起偏移 3
@@ -885,8 +895,8 @@ function procTotalTicks() {
 }
 
 // 单次遍历 /proc/[pid]（仅数字目录），对每个 pid 用 procCpuSample Map 做差分（复用
-// procCpuTicks/procTotalTicks），一次采样同时产出 perPid（各进程瞬时 pct）与 totalPct
-// （全部进程合计），保证两者同源、同差分基准、同窗口——各进程 pct 之和恒等于 totalPct。
+// procCpuTicks/procTotalTicks）得到原始瞬时值后，perPid 与 totalPct 均走统一 EMA 平滑
+// （ema(prev,current,CPU_EMA_ALPHA)），输出保留一位小数，避免 0/100 跳变。
 // 首次采样（pid 无上一轮状态）无差值：pct 记为 0（collectProcesses 对不在遍历结果内的
 // pid 再用 ps pcpu 兜底）。返回值 { perPid: Map<pid, pct>, totalPct }。
 function collectAllProcCpu() {
@@ -907,7 +917,8 @@ function collectAllProcCpu() {
     const pid = parseInt(name, 10);
     const curCpu = procCpuTicks(pid);
     if (curCpu === null) {
-      procCpuSample.delete(pid); // 进程已退出：清采样缓存
+      procCpuSample.delete(pid); // 进程已退出：清采样与平滑缓存
+      procCpuEma.delete(pid);
       continue;
     }
     const last = procCpuSample.get(pid);
@@ -917,15 +928,24 @@ function collectAllProcCpu() {
       if (dCpu >= 0) {
         sumTicks += dCpu;
         if (!dTotal) dTotal = curTotal - last.total; // 系统总时间差值，本轮全局一致
-        pct = Math.round((dCpu / dTotal) * 1000) / 10;
+        pct = (dCpu / dTotal) * 100; // 原始瞬时占用（未舍入）
         hasPrev = true;
       }
     }
-    procCpuSample.set(pid, { cpu: curCpu, total: curTotal, pct });
-    perPid.set(pid, pct);
+    procCpuSample.set(pid, { cpu: curCpu, total: curTotal });
+    // 每个 pid 走统一 EMA 平滑（同函数同 alpha），输出保留一位小数
+    const smoothed = ema(procCpuEma.get(pid), pct, CPU_EMA_ALPHA);
+    procCpuEma.set(pid, smoothed);
+    perPid.set(pid, Math.round(smoothed * 10) / 10);
   }
-  if (!hasPrev || dTotal <= 0) return { perPid, totalPct: 0 };
-  return { perPid, totalPct: Math.round((sumTicks / dTotal) * 1000) / 10 };
+  let totalPct = 0;
+  if (hasPrev && dTotal > 0) {
+    // 总占用走统一 EMA（对原始瞬时总占用平滑，与各进程同函数同 alpha）
+    const smoothed = ema(totalEmaPrev, (sumTicks / dTotal) * 100, CPU_EMA_ALPHA);
+    totalEmaPrev = smoothed;
+    totalPct = Math.round(smoothed * 10) / 10;
+  }
+  return { perPid, totalPct };
 }
 
 // 采集 TOP 内存进程（单列进程排行）：ps 按 RSS 降序取前 15。
