@@ -1,0 +1,17 @@
+{
+  "name": "admin-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "个人网站 Admin 系统后端：认证 / 系统监控 / 文件上传下载 / Hermes WS 桥接",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "express": "^4.19.2",
+    "ioredis": "^5.4.1",
+    "multer": "^1.4.5-lts.1",
+    "ws": "^8.18.0"
+  }
+}

@@ -1,0 +1,897 @@
+'use strict';
+
+/**
+ * admin-server 入口
+ *  - REST 接口：登录 / 系统信息 / 上传 / 下载 / 修改密码
+ *  - WebSocket 桥接：客户端 <-> Hermes(9119) 双向透传 JSON-RPC 帧
+ */
+
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+const { execSync } = require('child_process');
+const crypto = require('crypto');
+const express = require('express');
+const http = require('http');
+const net = require('net');
+const Redis = require('ioredis');
+const multer = require('multer');
+const { WebSocketServer, WebSocket } = require('ws');
+const config = require('./config');
+
+const PORT = parseInt(process.env.PORT, 10) || 3100;
+const HOST = process.env.HOST || '0.0.0.0';
+const UPLOAD_DIR = process.env.ADMIN_UPLOAD_DIR || path.join(__dirname, '..', 'uploads'); // 上传文件目录
+const HERMES_WS_URL = 'ws://127.0.0.1:9119/api/ws'; // Hermes WebSocket 网关
+const HERMES_TOKEN_FILE = '/root/.hermes/dashboard_token'; // Hermes 访问令牌
+
+// 多会话：Redis key 带 token 后缀（admin:session:<token>），每个会话独立，多端可同时登录
+const SESSION_KEY_PREFIX = process.env.ADMIN_REDIS_PREFIX || 'admin:session:';
+const SESSION_TTL = 43200; // 12 小时，每次请求校验通过后滑动续期
+
+function sessionKey(token) {
+  return SESSION_KEY_PREFIX + token;
+}
+
+// 登录失败锁定：按 IP 计数，5 次失败锁 15 分钟（TTL 900），锁定期登录返回 429
+const LOGIN_FAIL_PREFIX = 'admin:login_fail:';
+const LOGIN_MAX_FAILS = 5;
+const LOGIN_LOCK_TTL = 900;
+
+function loginFailKey(ip) {
+  return LOGIN_FAIL_PREFIX + ip;
+}
+
+// 审计日志：JSON 行追加写 /root/proj/admin-server/audit.log，写入失败不影响业务
+const AUDIT_LOG_FILE =
+  process.env.ADMIN_AUDIT_LOG || path.join(__dirname, '..', 'audit.log');
+
+function auditLog(action, ip, ok, detail) {
+  const line =
+    JSON.stringify({
+      ts: new Date().toISOString(),
+      action,
+      ip: ip || 'unknown',
+      ok: !!ok,
+      detail: detail || ''
+    }) + '\n';
+  try {
+    fs.appendFileSync(AUDIT_LOG_FILE, line);
+  } catch (e) {
+    // 审计日志写入失败仅告警，不阻断业务
+    console.error('[admin-server] 审计日志写入失败:', e.message);
+  }
+}
+
+// 取客户端 IP：优先 req.ip（Express 已处理 X-Forwarded-For），退化为 socket 地址
+function clientIp(req) {
+  return req.ip || (req.socket && req.socket.remoteAddress) || 'unknown';
+}
+
+// 内部通知接口来源校验：设置 ADMIN_NOTIFY_KEY 后，携带匹配密钥的请求可从任意来源调用；
+// 未设置时仅允许本机回环地址（::ffff:127.0.0.1 是 IPv4 映射 IPv6 的形式）
+const ADMIN_NOTIFY_KEY = process.env.ADMIN_NOTIFY_KEY || '';
+
+function isLoopbackAddr(addr) {
+  const a = String(addr || '');
+  return a === '127.0.0.1' || a === '::1' || a === '::ffff:127.0.0.1';
+}
+
+// Redis 连接，失败时启动报错退出
+const redis = new Redis('redis://127.0.0.1:6379');
+redis.on('error', (err) => {
+  console.error('[admin-server] Redis 连接失败:', err.message);
+  process.exit(1);
+});
+
+// 上传目录不存在则自动创建
+fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+
+const app = express();
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+/* ============ 工具函数 ============ */
+
+// SHA-256 后定时安全比较，避免时序攻击
+function sha256(str) {
+  return crypto.createHash('sha256').update(String(str)).digest();
+}
+
+function verifyPassword(input, stored) {
+  const a = sha256(input);
+  const b = sha256(stored);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+// Redis 单例会话鉴权中间件。支持 Authorization: Bearer <token>，也支持 query ?token=
+// （query 形式主要为了 <img src> 等无法携带 Header 的场景）
+async function authRequired(req, res, next) {
+  const header = req.headers.authorization || '';
+  const headerToken = header.startsWith('Bearer ') ? header.slice(7).trim() : null;
+  const queryToken = req.query && req.query.token ? String(req.query.token) : null;
+  const token = headerToken || queryToken;
+  if (!token) {
+    return res.status(401).json({ error: '未登录' });
+  }
+  try {
+    const stored = await redis.get(sessionKey(token));
+    if (!stored || stored !== token) {
+      return res.status(401).json({ error: '未登录或会话已过期' });
+    }
+    await redis.expire(sessionKey(token), SESSION_TTL); // 滑动续期
+    req.user = { role: 'admin' };
+    next();
+  } catch (e) {
+    return res.status(500).json({ error: '会话服务异常' });
+  }
+}
+
+/* ============ 系统信息采集 ============ */
+
+// CPU 采样：累加各核 times
+function cpuSample() {
+  let idle = 0;
+  let total = 0;
+  for (const cpu of os.cpus()) {
+    for (const t of Object.values(cpu.times)) total += t;
+    idle += cpu.times.idle;
+  }
+  return { idle, total };
+}
+
+// 通过两次采样计算 CPU 使用率
+// CPU 采样滑动平均（EMA）：抹平单核机器上 150ms 瞬时采样的 0%/100% 跳变
+let cpuEma = null
+const CPU_EMA_ALPHA = 0.4 // 新采样权重；越大响应越快、平滑越弱
+
+function getCpuInfo() {
+  const a = cpuSample();
+  return new Promise((resolve) => {
+    setTimeout(() => {
+      const b = cpuSample();
+      const totalDiff = b.total - a.total;
+      const idleDiff = b.idle - a.idle;
+      const usage = totalDiff > 0 ? ((totalDiff - idleDiff) / totalDiff) * 100 : 0;
+      // EMA 平滑：cpuEma = cpuEma * (1-α) + usage * α
+      cpuEma = cpuEma === null ? usage : cpuEma * (1 - CPU_EMA_ALPHA) + usage * CPU_EMA_ALPHA;
+      const cpus = os.cpus();
+      resolve({
+        model: cpus[0] ? cpus[0].model.trim() : 'unknown',
+        usage_percent: Math.round(cpuEma * 100) / 100,
+        cores: cpus.length,
+        loadavg: os.loadavg()
+      });
+    }, 300); // 采样窗口 150→300ms，配合 EMA 平滑
+  });
+}
+
+// 磁盘：取 df -kP 中挂载点为 '/' 的行，仅统计总量，不做目录明细扫描（单位字节）
+function getDisk() {
+  const disk = { total: 0, used: 0, free: 0, percent: 0 };
+  try {
+    const out = execSync('df -kP', { encoding: 'utf-8' }).trim().split('\n');
+    for (const line of out.slice(1)) {
+      const cols = line.split(/\s+/);
+      if (cols.length < 6 || cols.slice(5).join(' ') !== '/') continue;
+      disk.total = parseInt(cols[1], 10) * 1024;
+      disk.used = parseInt(cols[2], 10) * 1024;
+      disk.free = parseInt(cols[3], 10) * 1024;
+      disk.percent = parseInt(String(cols[4]).replace('%', ''), 10) || 0;
+      break;
+    }
+  } catch (e) {
+    // df 失败时保留全 0
+  }
+
+  return disk;
+}
+
+// 网速采样：累加 /proc/net/dev 所有接口的 rx_bytes / tx_bytes
+function netSample() {
+  let rx = 0;
+  let tx = 0;
+  try {
+    const lines = fs.readFileSync('/proc/net/dev', 'utf-8').trim().split('\n');
+    for (const line of lines.slice(2)) {
+      const idx = line.indexOf(':');
+      if (idx === -1) continue;
+      const stats = line.slice(idx + 1).trim().split(/\s+/);
+      if (stats.length < 9) continue;
+      rx += parseInt(stats[0], 10) || 0;
+      tx += parseInt(stats[8], 10) || 0;
+    }
+  } catch (e) {
+    // /proc/net/dev 读取失败时保留 0
+  }
+  return { rx, tx };
+}
+
+// 磁盘 I/O 采样：读 /proc/diskstats，取主盘设备（sda/vda 等，不含分区），
+// 扇区读/写字段（第 6、10 列）×512 得字节
+function diskioSample() {
+  let read = 0;
+  let write = 0;
+  try {
+    const lines = fs.readFileSync('/proc/diskstats', 'utf-8').trim().split('\n');
+    for (const line of lines) {
+      const cols = line.trim().split(/\s+/);
+      if (cols.length < 11) continue;
+      const name = cols[2];
+      // 主盘设备名形如 sd[a-z]/vd[a-z]/hd[a-z]（无分区数字后缀），分区 minor > 0 排除
+      if (!/^(sd[a-z]|vd[a-z]|hd[a-z])$/.test(name)) continue;
+      if (parseInt(cols[1], 10) !== 0) continue;
+      read += parseInt(cols[5], 10) * 512 || 0;
+      write += parseInt(cols[9], 10) * 512 || 0;
+    }
+  } catch (e) {
+    // /proc/diskstats 读取失败时保留 0
+  }
+  return { read, write };
+}
+
+// 进程数：解析 /proc/loadavg 第 4 列 running/total
+function getProcesses() {
+  const proc = { running: 0, total: 0 };
+  try {
+    const cols = fs.readFileSync('/proc/loadavg', 'utf-8').trim().split(/\s+/);
+    if (cols.length >= 4) {
+      const m = cols[3].split('/');
+      proc.running = parseInt(m[0], 10) || 0;
+      proc.total = parseInt(m[1], 10) || 0;
+    }
+  } catch (e) {
+    // 读取失败时保留 0
+  }
+  return proc;
+}
+
+// 模块级采样状态：保存上一次采样 { ts, ... } 用于计算速率
+const netState = { ts: 0, rx: 0, tx: 0 };
+const diskioState = { ts: 0, read: 0, write: 0 };
+
+// 网络：本次采样与上次采样做差，按时间差换算字节/秒；首次请求速率返回 0
+function getNetInfo() {
+  const cur = netSample();
+  const now = Date.now();
+  const dt = (now - netState.ts) / 1000;
+  const info = {
+    rx_bytes: cur.rx,
+    tx_bytes: cur.tx,
+    rx_rate: 0,
+    tx_rate: 0
+  };
+  if (netState.ts && dt > 0) {
+    info.rx_rate = Math.max(0, (cur.rx - netState.rx) / dt);
+    info.tx_rate = Math.max(0, (cur.tx - netState.tx) / dt);
+  }
+  netState.ts = now;
+  netState.rx = cur.rx;
+  netState.tx = cur.tx;
+  return info;
+}
+
+// 磁盘 I/O：同上，返回读/写速率（字节/秒）
+function getDiskIoInfo() {
+  const cur = diskioSample();
+  const now = Date.now();
+  const dt = (now - diskioState.ts) / 1000;
+  const info = {
+    read_bytes: cur.read,
+    write_bytes: cur.write,
+    read_rate: 0,
+    write_rate: 0
+  };
+  if (diskioState.ts && dt > 0) {
+    info.read_rate = Math.max(0, (cur.read - diskioState.read) / dt);
+    info.write_rate = Math.max(0, (cur.write - diskioState.write) / dt);
+  }
+  diskioState.ts = now;
+  diskioState.read = cur.read;
+  diskioState.write = cur.write;
+  return info;
+}
+
+// 采集系统信息（CPU 需 ~150ms 双采样）
+async function collectSystem() {
+  const total = os.totalmem();
+  const free = os.freemem();
+  const used = total - free;
+  return {
+    cpu: await getCpuInfo(),
+    memory: {
+      total,
+      used,
+      free,
+      percent: Math.round((used / total) * 1000) / 10
+    },
+    disk: getDisk(),
+    network: getNetInfo(),
+    disk_io: getDiskIoInfo(),
+    processes: getProcesses(),
+    uptime: os.uptime(),
+    os: `${os.type()} ${os.release()} (${os.arch()})`,
+    hostname: os.hostname()
+  };
+}
+
+/* ============ 历史采样（模块级环形 buffer） ============ */
+
+const HISTORY_MAX = 120; // 最多保留 120 个采样点
+const HISTORY_INTERVAL_MS = 5000; // 每 5 秒采样一次
+const historyBuffer = [];
+
+// 历史数据落盘：多实例共享同一份数据（见 acquireSamplerLock），路由统一读文件返回
+const HISTORY_FILE =
+  process.env.ADMIN_HISTORY_FILE || path.join(os.tmpdir(), 'admin-server-history.json');
+
+// 采样器锁文件：多个 admin-server 实例共存时只允许一个实例持有采样器，避免重复采样
+const SAMPLER_LOCK_FILE =
+  process.env.ADMIN_SAMPLER_LOCK || path.join(os.tmpdir(), 'admin-server-sampler.lock');
+
+function isPidAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return !!(e && e.code === 'EPERM'); // 进程存在但当前用户无权限探测
+  }
+}
+
+// 尝试获取采样器独占锁（返回是否持有）。锁文件记录持有者 pid，
+// 若 pid 已失效（进程退出/崩溃遗留的陈旧锁）则视为可抢占
+function acquireSamplerLock() {
+  try {
+    if (fs.existsSync(SAMPLER_LOCK_FILE)) {
+      const holder = parseInt(fs.readFileSync(SAMPLER_LOCK_FILE, 'utf-8').trim(), 10);
+      if (holder && holder !== process.pid && isPidAlive(holder)) {
+        return false; // 已有活跃实例持有采样器
+      }
+    }
+    fs.writeFileSync(SAMPLER_LOCK_FILE, String(process.pid));
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+// 原子写历史文件（先写临时文件再 rename，避免读端读到半截内容）
+function persistHistory() {
+  try {
+    const tmp = HISTORY_FILE + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(historyBuffer));
+    fs.renameSync(tmp, HISTORY_FILE);
+  } catch (e) {
+    // 落盘失败不影响内存 buffer
+  }
+}
+
+// 读取历史：优先从文件（多实例共享），文件不可用则退回本进程内存 buffer
+function readHistory() {
+  try {
+    const raw = fs.readFileSync(HISTORY_FILE, 'utf-8');
+    const arr = JSON.parse(raw);
+    if (Array.isArray(arr)) return arr.slice(-HISTORY_MAX);
+  } catch (e) {
+    // 文件尚未生成/不可读：退回内存 buffer
+  }
+  return historyBuffer.slice(-HISTORY_MAX);
+}
+
+// 采样器自身的上一次原始采样（用于计算两次采样之间的差值速率/使用率）
+let histCpuPrev = null
+let histCpuEma = null // history CPU 滑动平均;
+let histNetPrev = null;
+let histDiskioPrev = null;
+
+// 内存使用率（百分比，一位小数）
+function memPercent() {
+  const total = os.totalmem();
+  if (total <= 0) return 0;
+  return Math.round(((total - os.freemem()) / total) * 1000) / 10;
+}
+
+// 每次采样：CPU/内存为百分比，网速与磁盘 I/O 为两次采样差值换算的速率（字节/秒）。
+// 直接读原始计数（cpuSample/netSample/diskioSample），不扰动 /api/admin/system 的独立采样状态
+function sampleHistory() {
+  const now = Date.now();
+  const cpu = cpuSample();
+  const net = netSample();
+  const io = diskioSample();
+
+  let cpuPercent = 0;
+  if (histCpuPrev && now > histCpuPrev.ts) {
+    const totalDiff = cpu.total - histCpuPrev.total;
+    const idleDiff = cpu.idle - histCpuPrev.idle;
+    const raw = totalDiff > 0 ? ((totalDiff - idleDiff) / totalDiff) * 100 : 0;
+    // history 采样同样走 EMA 平滑，避免趋势图跳变
+    histCpuEma = histCpuEma === null ? raw : histCpuEma * (1 - CPU_EMA_ALPHA) + raw * CPU_EMA_ALPHA;
+    cpuPercent = Math.round(histCpuEma * 10) / 10;
+  }
+
+  const dtNet = histNetPrev ? (now - histNetPrev.ts) / 1000 : 0;
+  const dtIo = histDiskioPrev ? (now - histDiskioPrev.ts) / 1000 : 0;
+  const netRxRate = histNetPrev && dtNet > 0 ? Math.max(0, (net.rx - histNetPrev.rx) / dtNet) : 0;
+  const netTxRate = histNetPrev && dtNet > 0 ? Math.max(0, (net.tx - histNetPrev.tx) / dtNet) : 0;
+  const ioReadRate =
+    histDiskioPrev && dtIo > 0 ? Math.max(0, (io.read - histDiskioPrev.read) / dtIo) : 0;
+  const ioWriteRate =
+    histDiskioPrev && dtIo > 0 ? Math.max(0, (io.write - histDiskioPrev.write) / dtIo) : 0;
+
+  histCpuPrev = { ts: now, idle: cpu.idle, total: cpu.total };
+  histNetPrev = { ts: now, rx: net.rx, tx: net.tx };
+  histDiskioPrev = { ts: now, read: io.read, write: io.write };
+
+  historyBuffer.push({
+    ts: now,
+    cpu: cpuPercent,
+    mem_percent: memPercent(),
+    net_rx_rate: Math.round(netRxRate),
+    net_tx_rate: Math.round(netTxRate),
+    disk_io_read: Math.round(ioReadRate),
+    disk_io_write: Math.round(ioWriteRate)
+  });
+  if (historyBuffer.length > HISTORY_MAX) historyBuffer.shift();
+
+  persistHistory();
+}
+
+// 启动采样器：仅在持有锁的实例上运行（避免多实例重复采样）。
+// 启动时立即采一次，之后每 HISTORY_INTERVAL_MS 采一次
+if (acquireSamplerLock()) {
+  sampleHistory();
+  const historyTimer = setInterval(sampleHistory, HISTORY_INTERVAL_MS);
+  historyTimer.unref?.();
+  process.on('exit', () => {
+    try {
+      fs.unlinkSync(SAMPLER_LOCK_FILE);
+    } catch (e) {
+      // 忽略清理失败
+    }
+  });
+  console.log(`[admin-server] 历史采样器已启动（每 ${HISTORY_INTERVAL_MS / 1000}s 一次，最多 ${HISTORY_MAX} 点）`);
+}
+
+/* ============ 服务状态检测 ============ */
+
+// 待检测服务：端口监听判定 up/down。admin-server 为自身（恒 up，pid 为本进程）
+const SERVICE_CHECKS = [
+  { name: 'admin-server', port: PORT, self: true },
+  { name: 'hermes-gateway', port: null, kind: 'systemd' },
+  { name: 'hermes-serve', port: 9119 },
+  { name: 'nginx', port: 80 },
+  { name: 'redis', port: 6379 },
+  { name: 'cloudreve', port: 5212 },
+  { name: 'alist', port: 5244 },
+  { name: 'blog', port: 4000 },
+  { name: 'admin-test', port: 3101 }
+];
+
+// 尝试 TCP 连接目标端口，connect 成功即视为 up
+function checkTcpPort(port, host = '127.0.0.1', timeout = 1500) {
+  return new Promise((resolve) => {
+    const socket = new net.Socket();
+    let settled = false;
+    const finish = (ok) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve(ok);
+    };
+    socket.setTimeout(timeout);
+    socket.once('connect', () => finish(true));
+    socket.once('timeout', () => finish(false));
+    socket.once('error', () => finish(false));
+    socket.connect(port, host);
+  });
+}
+
+// 通过 ss -ltnp 反查监听端口的进程 pid（不可用/失败返回 null）
+function pidByPort(port) {
+  try {
+    const out = execSync(
+      `ss -ltnp 2>/dev/null | awk '$4 ~ /:${port}$/ {print $6}' | head -1`,
+      { encoding: 'utf-8' }
+    );
+    const m = out.match(/pid=(\d+)/);
+    return m ? Number(m[1]) : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+// 采集全部服务状态
+async function collectServices() {
+  const results = await Promise.all(
+    SERVICE_CHECKS.map(async (svc) => {
+      if (svc.self) {
+        return { name: svc.name, status: 'up', pid: process.pid };
+      }
+      if (svc.kind === 'systemd') {
+        // systemd 服务检测：无固定端口（如 hermes-gateway），用 systemctl is-active
+        try {
+          const out = require('child_process')
+            .execSync(`systemctl is-active ${svc.name}.service`, { timeout: 3000 })
+            .toString()
+            .trim();
+          const up = out === 'active';
+          return { name: svc.name, status: up ? 'up' : 'down', pid: up ? pidByProcessName(svc.name) : null };
+        } catch {
+          return { name: svc.name, status: 'down', pid: null };
+        }
+      }
+      const up = await checkTcpPort(svc.port);
+      return {
+        name: svc.name,
+        status: up ? 'up' : 'down',
+        pid: up ? pidByPort(svc.port) : null
+      };
+    })
+  );
+  return results;
+}
+
+// 按进程名反查 pid（systemd 服务用）
+function pidByProcessName(name) {
+  try {
+    const out = require('child_process')
+      .execSync(`pgrep -f "${name}" | head -1`, { timeout: 3000 })
+      .toString()
+      .trim();
+    return out ? parseInt(out, 10) : null;
+  } catch {
+    return null;
+  }
+}
+
+/* ============ REST 路由 ============ */
+
+app.get('/', (req, res) => {
+  res.json({ name: 'admin-server', status: 'ok' });
+});
+
+// 登录：密码比对成功后写入 Redis 独立会话（12h 过期，key 带 token 后缀，多端共存）
+// 除 config.json 的 admin_password 外，若设置了环境变量 ADMIN_TEST_PASSWORD（仅测试环境注入，
+// 生产 systemd 不设置），输入该值同样允许登录，签发正常会话 token
+app.post('/api/admin/login', async (req, res) => {
+  const { password } = req.body || {};
+  const ip = clientIp(req);
+  const failKey = loginFailKey(ip);
+  try {
+    // 锁定检查：失败次数已达上限（TTL 内），直接 429 拒绝，不再比对密码
+    const fails = parseInt(await redis.get(failKey), 10) || 0;
+    if (fails >= LOGIN_MAX_FAILS) {
+      auditLog('login', ip, false, `锁定中（已失败 ${fails} 次）`);
+      return res.status(429).json({ error: '尝试过多，请稍后再试' });
+    }
+    const testPwd = process.env.ADMIN_TEST_PASSWORD;
+    const testOk =
+      !!testPwd && verifyPassword(password, testPwd);
+    if (!password || (!verifyPassword(password, config.get().admin_password) && !testOk)) {
+      const next = await redis.incr(failKey);
+      await redis.expire(failKey, LOGIN_LOCK_TTL); // 每次失败都刷新 15 分钟窗口
+      auditLog('login', ip, false, `密码错误（第 ${next}/${LOGIN_MAX_FAILS} 次）`);
+      return res.status(401).json({ error: '密码错误' });
+    }
+    // 登录成功：清除该 IP 失败计数，签发会话
+    await redis.del(failKey);
+    auditLog('login', ip, true, 'ok');
+    const token = crypto.randomBytes(32).toString('hex');
+    await redis.set(sessionKey(token), token, 'EX', SESSION_TTL);
+    res.json({ token });
+  } catch (e) {
+    auditLog('login', ip, false, '会话服务异常');
+    res.status(500).json({ error: '会话服务异常' });
+  }
+});
+
+// 系统信息（需鉴权）。每次请求实时采集，无缓存
+app.get('/api/admin/system', authRequired, async (req, res) => {
+  try {
+    const data = await collectSystem();
+    // 请求驱动：每次实时采样也写入历史 buffer，趋势图与上方实时数据同源
+    try {
+      sampleHistory();
+    } catch {
+      /* 采样失败不影响主响应 */
+    }
+    res.json(data);
+  } catch (e) {
+    res.status(500).json({ error: '获取系统信息失败: ' + e.message });
+  }
+});
+
+// 历史采样（需鉴权）。返回环形 buffer 中的采样点（最多 120 点），多实例共享
+app.get('/api/admin/system/history', authRequired, (req, res) => {
+  res.json(readHistory());
+});
+
+// 服务状态（需鉴权）。返回各服务 [{ name, status: up/down, pid? }]
+app.get('/api/admin/services', authRequired, async (req, res) => {
+  try {
+    const [services, processes] = await Promise.all([collectServices(), collectProcesses()]);
+    res.json({ services, processes });
+  } catch (e) {
+    res.status(500).json({ error: '获取服务状态失败: ' + e.message });
+  }
+});
+
+// 采集 TOP 内存进程（单列进程排行）：ps 按 RSS 降序取前 15
+function collectProcesses() {
+  try {
+    const out = execSync(
+      "ps -eo pid,comm,rss,pcpu,args --sort=-rss | head -16 | tail -15",
+      { encoding: 'utf-8' }
+    );
+    return out
+      .trim()
+      .split('\n')
+      .map((line) => {
+        const m = line.trim().split(/\s+/);
+        if (m.length < 5) return null;
+        const memMb = Math.round((parseInt(m[2], 10) || 0) / 1024);
+        const args = m.slice(4).join(' ');
+        // Hermes 进程按命令行参数区分：gateway run / serve
+        let name = m[1];
+        if (args.includes('gateway run')) name = 'hermes-gateway';
+        else if (args.includes('hermes serve')) name = 'hermes-serve';
+        else if (args.includes('node') && args.includes('admin-server')) name = 'admin-server';
+        else if (args.includes('node') && args.includes('blog')) name = 'blog-server';
+        return {
+          name,
+          pid: parseInt(m[0], 10),
+          mem_mb: memMb,
+          cpu: Math.round((parseFloat(m[3]) || 0) * 10) / 10
+        };
+      })
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+// 上传：保存到 uploads 目录，按时间戳命名，限制单文件 100MB
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, UPLOAD_DIR),
+  filename: (req, file, cb) => {
+    const ext = path.extname(file.originalname) || '';
+    cb(null, `${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`);
+  }
+});
+const upload = multer({ storage, limits: { fileSize: 100 * 1024 * 1024 } });
+
+app.post('/api/admin/upload', authRequired, upload.single('file'), (req, res) => {
+  if (!req.file) {
+    auditLog('upload', clientIp(req), false, '未收到文件');
+    return res.status(400).json({ error: '未收到文件（字段名应为 file）' });
+  }
+  auditLog('upload', clientIp(req), true, req.file.path); // 记录落盘路径
+  res.json({ path: req.file.path }); // 返回绝对路径，供 image.attach / file.attach 使用
+});
+
+// 下载白名单根目录：AI 回复的文件可能落在 uploads、/root、/tmp、/home、/var/www 等位置
+const DOWNLOAD_ALLOWED_BASES = [UPLOAD_DIR, '/root', '/tmp', '/home', '/var/www']
+  .map((d) => path.resolve(d))
+  .filter((d) => d.startsWith(path.sep));
+
+// 下载：路径 resolve 后必须落在任一白名单目录内，再以附件形式返回
+app.get('/api/admin/download', authRequired, (req, res) => {
+  const p = req.query.path;
+  if (!p || typeof p !== 'string') {
+    return res.status(400).json({ error: '缺少 path 参数' });
+  }
+  // 支持官方 MEDIA:~/path 形态：~ 展开为 home 目录
+  const expanded = p.startsWith('~/') ? path.join(os.homedir(), p.slice(2)) : p;
+  const resolved = path.resolve(expanded);
+  const allowed = DOWNLOAD_ALLOWED_BASES.some(
+    (base) => resolved === base || resolved.startsWith(base + path.sep)
+  );
+  if (!allowed) {
+    return res.status(400).json({ error: '路径不在允许范围内' });
+  }
+  if (!fs.existsSync(resolved) || !fs.statSync(resolved).isFile()) {
+    return res.status(404).json({ error: '文件不存在' });
+  }
+  res.download(resolved);
+});
+
+// 修改密码（需鉴权）：验证旧密码后更新 config.json，并删除 Redis 会话使所有已登录会话失效
+app.post('/api/admin/password', authRequired, async (req, res) => {
+  const { old_password, new_password } = req.body || {};
+  const ip = clientIp(req);
+  if (!verifyPassword(old_password || '', config.get().admin_password)) {
+    auditLog('password', ip, false, '旧密码错误');
+    return res.status(400).json({ error: '旧密码错误' });
+  }
+  if (typeof new_password !== 'string' || new_password.length < 6) {
+    return res.status(400).json({ error: '新密码至少 6 位' });
+  }
+  try {
+    config.setAdminPassword(new_password);
+    auditLog('password', ip, true, '修改密码');
+    const keys = await redis.keys(SESSION_KEY_PREFIX + '*');
+    if (keys.length) await redis.del(...keys);
+    res.json({ ok: true, msg: '密码已修改，请重新登录' });
+  } catch (e) {
+    auditLog('password', ip, false, '会话服务异常');
+    res.status(500).json({ error: '会话服务异常' });
+  }
+});
+
+// 全局错误处理（multer 体积超限等）
+app.use((err, req, res, next) => {
+  if (err instanceof multer.MulterError) {
+    const status = err.code === 'LIMIT_FILE_SIZE' ? 413 : 400;
+    return res.status(status).json({ error: '文件过大（上限 100MB）' });
+  }
+  console.error('[admin-server] 未捕获错误:', err);
+  res.status(500).json({ error: '服务器内部错误' });
+});
+
+/* ============ WebSocket 桥接 ============ */
+
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server, path: '/api/admin/ws' });
+
+// 从 query 或 Sec-WebSocket-Protocol 中取 token
+function extractToken(req) {
+  const url = new URL(req.url, 'http://localhost');
+  const q = url.searchParams.get('token');
+  if (q) return q;
+  const proto = req.headers['sec-websocket-protocol'];
+  if (proto) return proto.split(',')[0].trim();
+  return null;
+}
+
+wss.on('connection', async (ws, req) => {
+  // 1. 校验客户端 Redis 会话 token
+  const token = extractToken(req);
+  if (!token) {
+    ws.close(4001, 'missing token');
+    return;
+  }
+  try {
+    const stored = await redis.get(sessionKey(token));
+    if (!stored || stored !== token) {
+      ws.close(4001, 'invalid token');
+      return;
+    }
+    await redis.expire(sessionKey(token), SESSION_TTL); // 滑动续期
+  } catch (e) {
+    ws.close(4001, 'redis error');
+    return;
+  }
+
+  // 2. 读取 Hermes 令牌并连接网关
+  let hermesToken = '';
+  try {
+    hermesToken = fs.readFileSync(HERMES_TOKEN_FILE, 'utf-8').trim();
+  } catch (e) {
+    ws.close(5000, 'hermes token missing');
+    return;
+  }
+  const hermes = new WebSocket(
+    `${HERMES_WS_URL}?token=${encodeURIComponent(hermesToken)}`
+  );
+
+  // 3. 客户端消息缓冲队列：hermes 尚未 OPEN 时先入队，onopen 后按序 flush，
+  //    避免客户端连接后立即发 JSON-RPC 请求被静默丢弃导致永久超时
+  const pending = [];
+
+  const sendToHermes = (raw) => {
+    if (hermes.readyState === WebSocket.OPEN) {
+      hermes.send(raw);
+      return true;
+    }
+    return false;
+  };
+
+  // 按序 flush 缓冲队列（hermes 中途断开则停在原地，留给 onclose 兜底）
+  const flushPending = () => {
+    while (pending.length && sendToHermes(pending[0])) {
+      pending.shift();
+    }
+  };
+
+  // 尽量从原始帧中解析出 JSON-RPC id（解析失败视为通知帧，不回 error）
+  const getRpcId = (raw) => {
+    try {
+      const m = JSON.parse(raw);
+      return m && m.id != null ? m.id : undefined;
+    } catch (e) {
+      return undefined;
+    }
+  };
+
+  // 上游连接失败/关闭：给缓冲中的请求逐个回 JSON-RPC error，避免客户端永久超时
+  const failPending = (reason) => {
+    let item;
+    while ((item = pending.shift()) !== undefined) {
+      const id = getRpcId(item);
+      if (id !== undefined && ws.readyState === WebSocket.OPEN) {
+        ws.send(
+          JSON.stringify({ jsonrpc: '2.0', id, error: { code: -32000, message: reason } })
+        );
+      }
+    }
+  };
+
+  // 4. 双向透传：JSON 行原样转发
+  ws.on('message', (data) => {
+    const raw = data.toString();
+    if (!sendToHermes(raw)) {
+      pending.push(raw); // hermes 未就绪：缓冲等待 flush
+    }
+  });
+  hermes.on('message', (data) => {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(data.toString());
+    }
+  });
+
+  hermes.on('open', flushPending);
+
+  // 5. 任一端断开即关闭对端
+  const closeBoth = (reason) => {
+    if (pending.length) failPending(reason || '上游连接已断开');
+    if (ws.readyState === WebSocket.OPEN) ws.close();
+    if (hermes.readyState === WebSocket.OPEN) hermes.close();
+  };
+  ws.on('close', () => closeBoth('客户端已断开'));
+  ws.on('error', () => closeBoth('客户端连接异常'));
+  hermes.on('close', () => closeBoth('Hermes 连接已关闭'));
+  hermes.on('error', (err) =>
+    closeBoth('Hermes 连接失败: ' + ((err && err.message) || '未知错误'))
+  );
+});
+
+/* ============ 内部通知（外部平台消息实时通知） ============ */
+
+// 向所有已连接的 WS 客户端广播事件帧（仅 OPEN 连接），返回送达连接数
+function broadcastEvent(type, payload) {
+  const frame = JSON.stringify({
+    jsonrpc: '2.0',
+    method: 'event',
+    params: { type, payload }
+  });
+  let sent = 0;
+  wss.clients.forEach((ws) => {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(frame);
+      sent++;
+    }
+  });
+  return sent;
+}
+
+// 内部通知接口：供 Hermes pre_gateway_dispatch hook 调用（本机回环 POST，无需 JWT）。
+// 校验通过后向所有在线前端 WS 客户端广播 admin.external_message 事件。
+app.post('/api/admin/notify', (req, res) => {
+  const ip = clientIp(req);
+  const remote = req.socket && req.socket.remoteAddress;
+  const keyOk = !!ADMIN_NOTIFY_KEY && req.get('x-admin-notify-key') === ADMIN_NOTIFY_KEY;
+  if (!isLoopbackAddr(remote) && !keyOk) {
+    auditLog('notify', ip, false, '非本机来源被拒绝');
+    return res.status(403).json({ error: '仅允许本机或携带共享密钥调用' });
+  }
+  const { platform, chat_id, text } = req.body || {};
+  if (typeof chat_id !== 'string' || !chat_id || typeof text !== 'string') {
+    return res.status(400).json({ error: '缺少 chat_id 或 text' });
+  }
+  const sent = broadcastEvent('admin.external_message', {
+    platform: typeof platform === 'string' && platform ? platform : 'weixin',
+    chat_id,
+    text
+  });
+  auditLog('notify', ip, true, `platform=${platform} chat=${chat_id} sent=${sent}`);
+  res.json({ ok: true, sent });
+});
+
+/* ============ 启动 ============ */
+
+server.listen(PORT, HOST, () => {
+  console.log(`[admin-server] 已启动，监听地址: ${HOST}:${PORT}`);
+  console.log(`[admin-server] 上传目录: ${UPLOAD_DIR}`);
+  console.log(`[admin-server] 配置文件: ${config.CONFIG_PATH}`);
+  console.log(`[admin-server] 提示: 初始密码见 config.json 中的 admin_password 字段`);
+});
