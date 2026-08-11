@@ -9,7 +9,10 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { execSync } = require('child_process');
+const { exec, execSync } = require('child_process');
+const { promisify } = require('util');
+
+const execAsync = promisify(exec);
 const crypto = require('crypto');
 const express = require('express');
 const http = require('http');
@@ -689,14 +692,48 @@ app.post('/api/admin/sso/verify', async (req, res) => {
   }
 });
 
-// TOTP 设置 / 重置：挂载 totp-auth 模块路由
-//  POST /api/admin/totp/setup —— 首次设置（无鉴权，secret 已配置则 409）
-//  POST /api/admin/totp/reset —— 重置（需 Bearer JWT）
+// TOTP 重置 / 确认：转发到认证中心（带 Authorization 透传，认证中心校验 Redis 会话），
+// 由认证中心执行标准两阶段重置（reset 生成 pending → confirm 验证转正）
+const AUTH_CENTER_BASE_URL =
+  process.env.AUTH_CENTER_BASE_URL || 'http://127.0.0.1:3200';
+
+function forwardTotp(path) {
+  return async (req, res) => {
+    const ip = clientIp(req);
+    const url = new URL(AUTH_CENTER_BASE_URL + path);
+    const header = req.headers.authorization || '';
+    const headerToken = header.startsWith('Bearer ') ? header.slice(7).trim() : null;
+    const queryToken = req.query && req.query.token ? String(req.query.token) : null;
+    const token = headerToken || queryToken;
+    if (token) url.searchParams.set('token', token); // 认证中心兼容 header / query 两种透传
+    const headers = { Accept: 'application/json', 'Content-Type': 'application/json' };
+    if (headerToken) headers.Authorization = header;
+    try {
+      const upstream = await fetch(url, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(req.body || {}),
+        signal: AbortSignal.timeout(5000)
+      });
+      const data = await upstream.json().catch(() => ({}));
+      auditLog('totp_' + path.split('/').pop(), ip, upstream.ok, '转发认证中心');
+      return res.status(upstream.status).json(data);
+    } catch (e) {
+      auditLog('totp_' + path.split('/').pop(), ip, false, '认证中心不可达: ' + e.message);
+      return res.status(502).json({ error: '认证中心不可达' });
+    }
+  };
+}
+
+app.post('/api/admin/totp/reset', forwardTotp('/api/totp/reset'));
+app.post('/api/admin/totp/confirm', forwardTotp('/api/totp/confirm'));
+
+// TOTP 首次设置：挂载 totp-auth 模块路由（无鉴权，secret 已配置则 409）
 app.use('/api/admin/totp', (req, res, next) => {
   const ip = clientIp(req);
   res.on('finish', () => {
-    if (req.path === '/setup' || req.path === '/reset') {
-      auditLog('totp_' + req.path.slice(1), ip, res.statusCode < 400, 'ok');
+    if (req.path === '/setup') {
+      auditLog('totp_setup', ip, res.statusCode < 400, 'ok');
     }
   });
   next();
@@ -723,13 +760,8 @@ app.get('/api/admin/system/history', authRequired, (req, res) => {
   res.json(readHistory());
 });
 
-// 软件版本监控（需鉴权）：采集所有关键软件/服务版本
+// 软件版本监控（需鉴权）：只采集本地当前版本，不查外部 latest 接口
 const NODE_BIN = '/root/.nvm/versions/node/v24.19.0/bin';
-// execSync 以 sh 执行命令：systemd 环境 PATH 不含 node bin，npm CLI 的 shebang 依赖 env node，
-// 故所有 latestCmd 统一加完整 PATH 前缀
-const CMD_PATH = `PATH=${NODE_BIN}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`;
-const LATEST_TTL = 6 * 60 * 60 * 1000; // 最新版本缓存 6 小时
-const latestCache = new Map(); // name -> { ts, value }
 
 // 版本清洗：去 v/V 前缀、去开头的 epoch（形如 '5:8.0.2-3+deb13u2'，仅当最前为数字+冒号）、
 // 取第一个 '-' 前的主版本段。例：'5:8.0.2-3+deb13u2' → '8.0.2'；'v24.19.0' → '24.19.0'
@@ -742,82 +774,45 @@ function stripVersion(v) {
     .trim();
 }
 
-// 获取最新版本：latestCmd 为空/执行失败/输出为空时返回 '—'，成功结果缓存 6 小时（key=name）。
-// manual 模式仅表示不参与 upToDate 判定（由调用方恒视为最新），latest 同样拉取展示
-function getLatestVersion(v) {
-  if (!v.latestCmd) return '—';
-  const cached = latestCache.get(v.name);
-  if (cached && Date.now() - cached.ts < LATEST_TTL) return cached.value;
-  try {
-    const out = execSync(`${CMD_PATH} ${v.latestCmd}`, { encoding: 'utf-8', timeout: 10000 })
-      .trim()
-      .split('\n')[0];
-    if (!out) return '—';
-    latestCache.set(v.name, { ts: Date.now(), value: out });
-    return out;
-  } catch (e) {
-    return '—';
-  }
-}
-
-// 版本相等比较：两侧均先 stripVersion 清洗，取首个 x.y.z 数字序列按 . 分段比较；
-// 任一侧无版本号则视为不相等
-function versionEqual(a, b) {
-  const nums = (s) => {
-    const m = stripVersion(s).match(/\d+(?:\.\d+)*/);
-    return m ? m[0].split('.').map((p) => parseInt(p, 10) || 0) : null;
-  };
-  const pa = nums(a);
-  const pb = nums(b);
-  if (!pa || !pb) return false;
-  const len = Math.max(pa.length, pb.length);
-  for (let i = 0; i < len; i++) {
-    if ((pa[i] || 0) !== (pb[i] || 0)) return false;
-  }
-  return true;
-}
-
 const VERSION_CHECKS = [
-  { name: 'Node.js', category: 'runtime', cmd: `${NODE_BIN}/node --version`, latestCmd: `${NODE_BIN}/npm view node version` },
-  { name: 'npm', category: 'runtime', cmd: `PATH=${NODE_BIN}:$PATH ${NODE_BIN}/npm --version`, latestCmd: `${NODE_BIN}/npm view npm version` },
-  { name: 'Python', category: 'runtime', cmd: "python3 --version 2>&1 | awk '{print $2}'", latestCmd: 'apt-cache policy python3.13 2>/dev/null | awk \'/Candidate:/{print $2; exit}\'' },
-  { name: 'Hermes', category: 'service', compareMode: 'manual', cmd: "/usr/local/bin/hermes version 2>/dev/null | head -1 | grep -oE 'v[0-9.]+' | head -1 | sed 's/^v//'", latestCmd: "curl -s --max-time 8 -H 'User-Agent: admin-server' https://api.github.com/repos/NousResearch/hermes-agent/releases/latest | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"tag_name\"])'" },
-  { name: 'OpenCode', category: 'service', cmd: '/root/.nvm/versions/node/v24.19.0/bin/opencode --version 2>/dev/null | head -1', latestCmd: "curl -s --max-time 8 https://registry.npmjs.org/opencode-ai/latest | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"version\"])'" },
-  { name: 'dida-cli', category: 'service', cmd: "cat /root/.nvm/versions/node/v24.19.0/lib/node_modules/@suibiji/dida-cli/package.json | grep -m1 \"version\" | grep -oE '[0-9]+\\.[0-9]+\\.[0-9]+'", latestCmd: "curl -s --max-time 8 https://registry.npmjs.org/@suibiji/dida-cli/latest | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"version\"])'" },
-  { name: 'Cloudreve', category: 'service', cmd: "curl -s --max-time 3 http://127.0.0.1:5212/api/v4/site/ping | python3 -c \"import json,sys; print('v'+json.load(sys.stdin)['data'])\"", latestCmd: "curl -s --max-time 8 -H 'User-Agent: admin-server' https://api.github.com/repos/cloudreve/Cloudreve/releases/latest | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"tag_name\"])'" },
-  { name: 'Alist', category: 'service', cmd: "/root/proj/alist/alist version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1 | sed 's/^v//'", latestCmd: "curl -s --max-time 8 -H 'User-Agent: admin-server' https://api.github.com/repos/AlistGo/alist/releases/latest | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"tag_name\"])'" },
-  { name: 'DeepTutor', category: 'service', cmd: '/root/proj/deeptutor/.venv/bin/pip show deeptutor | grep -m1 Version | awk \'{print $2}\'', latestCmd: "curl -s --max-time 8 https://pypi.org/pypi/deeptutor/json | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"info\"][\"version\"])'" },
+  { name: 'Node.js', category: 'runtime', cmd: `${NODE_BIN}/node --version` },
+  { name: 'npm', category: 'runtime', cmd: `PATH=${NODE_BIN}:$PATH ${NODE_BIN}/npm --version` },
+  { name: 'Python', category: 'runtime', cmd: "python3 --version 2>&1 | awk '{print $2}'" },
+  { name: 'Hermes', category: 'service', cmd: "/usr/local/bin/hermes version 2>/dev/null | head -1 | grep -oE 'v[0-9.]+' | head -1 | sed 's/^v//'" },
+  // opencode 当前版本直接读 package.json（opencode --version 需 4.5s，cat 毫秒级）
+  { name: 'OpenCode', category: 'service', cmd: "cat /root/.nvm/versions/node/v24.19.0/lib/node_modules/opencode-ai/package.json | grep -m1 '\"version\"' | grep -oE '[0-9]+\\.[0-9]+\\.[0-9]+'" },
+  { name: 'dida-cli', category: 'service', cmd: "cat /root/.nvm/versions/node/v24.19.0/lib/node_modules/@suibiji/dida-cli/package.json | grep -m1 \"version\" | grep -oE '[0-9]+\\.[0-9]+\\.[0-9]+'" },
+  { name: 'Cloudreve', category: 'service', cmd: "curl -s --max-time 3 http://127.0.0.1:5212/api/v4/site/ping | python3 -c \"import json,sys; print('v'+json.load(sys.stdin)['data'])\"" },
+  { name: 'Alist', category: 'service', cmd: "/root/proj/alist/alist version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1 | sed 's/^v//'" },
+  { name: 'DeepTutor', category: 'service', cmd: '/root/proj/deeptutor/.venv/bin/pip show deeptutor | grep -m1 Version | awk \'{print $2}\'' },
 ];
 
+// 版本列表（需鉴权）：并行执行所有本地当前版本命令（Promise.allSettled，
+// 单条失败不影响其余），结果统一过 stripVersion 清洗（去 v 前缀、去 epoch、取 '-' 前主版本段）
 app.get('/api/admin/versions', authRequired, async (req, res) => {
-  const results = [];
-  for (const v of VERSION_CHECKS) {
-    let version;
-    let ok = true;
-    try {
-      version = execSync(v.cmd, { encoding: 'utf-8', timeout: 8000 })
-        .trim()
-        .split('\n')[0];
-    } catch (e) {
-      version = String(e.stderr || e.message || '').trim().split('\n')[0] || '不可用';
-      ok = false;
-    }
-    const latest = getLatestVersion(v);
-    results.push({
-      name: v.name,
-      category: v.category,
-      // version / latest 显示前统一过 stripVersion 清洗：去 v/V 前缀、去 epoch、取 '-' 前主版本段，
-      // 保证所有条目格式一致（如 24.19.0 / 11.17.0 / 3.13.5 / 2026.8.3）
-      version: stripVersion(version) || '未知',
-      ok,
-      latest: stripVersion(latest),
-      // manual（如 Hermes 双版本体系）不自动比较，恒视为最新避免误报；
-      // 其余仅当最新版本可获取且清洗后相等才算最新
-      upToDate:
-        v.compareMode === 'manual' || latest === '—' || versionEqual(version, latest),
+  try {
+    const settled = await Promise.allSettled(
+      VERSION_CHECKS.map(async (v) => {
+        const { stdout } = await execAsync(v.cmd, { encoding: 'utf-8', timeout: 8000 });
+        const version = stripVersion(String(stdout).trim().split('\n')[0]) || '未知';
+        return { name: v.name, category: v.category, version, ok: true };
+      })
+    );
+    res.json({
+      list: settled.map((s, i) =>
+        s.status === 'fulfilled'
+          ? s.value
+          : {
+              name: VERSION_CHECKS[i].name,
+              category: VERSION_CHECKS[i].category,
+              version: '未知',
+              ok: false
+            }
+      )
     });
+  } catch (e) {
+    res.status(500).json({ error: '获取软件版本失败: ' + e.message });
   }
-  res.json({ list: results });
 });
 
 // 服务状态（需鉴权）。返回各服务 [{ name, status: up/down, pid? }]
@@ -845,12 +840,24 @@ function collectProcesses() {
         if (m.length < 5) return null;
         const memMb = Math.round((parseInt(m[2], 10) || 0) / 1024);
         const args = m.slice(4).join(' ');
-        // Hermes 进程按命令行参数区分：gateway run / serve
+        // 进程命名：优先匹配特征明显的关键字，避免任务描述路径中的服务名造成误判
         let name = m[1];
-        if (args.includes('gateway run')) name = 'hermes-gateway';
+        const pid = parseInt(m[0], 10);
+        if (args.includes('opencode')) name = 'opencode';
+        else if (args.includes('node') && args.includes('agent-browser')) name = 'agent-browser';
+        else if (args.includes('gateway run')) name = 'hermes-gateway';
         else if (args.includes('hermes serve')) name = 'hermes-serve';
-        else if (args.includes('node') && args.includes('admin-server')) name = 'admin-server';
         else if (args.includes('node') && args.includes('blog')) name = 'blog-server';
+        else if (args.includes('node') && args.includes('admin-server')) name = 'admin-server';
+        else if (args.includes('node') && args.includes('src/index.js')) {
+          // admin-server 实际启动 args 不含 'admin-server' 字样：读 /proc/<pid>/cwd 判定
+          try {
+            const cwd = fs.readlinkSync(`/proc/${pid}/cwd`);
+            name = cwd === '/root/proj/admin-server' ? 'admin-server' : 'node';
+          } catch (e) {
+            name = 'node';
+          }
+        }
         return {
           name,
           pid: parseInt(m[0], 10),
