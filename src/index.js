@@ -857,6 +857,43 @@ const SYSTEMD_SERVICES = [
   'hermes-serve'
 ];
 
+// 模块级进程瞬时 CPU 采样状态：pid -> { cpu, total, pct }（上次 /proc 采样值，单位 clock ticks）
+const procCpuSample = new Map();
+
+// 读 /proc/<pid>/stat，返回进程已用 CPU ticks（utime+stime，字段 14/15）；
+// 进程名可能含空格，取最后一个 ')' 后的字段再按空格分割，字段 3 起偏移 3
+function procCpuTicks(pid) {
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf-8');
+    const close = stat.lastIndexOf(')');
+    if (close === -1) return null;
+    const rest = stat.slice(close + 1).trim().split(/\s+/);
+    // rest[0]=字段3(state)，字段14 utime → rest[11]，字段15 stime → rest[12]
+    const utime = parseInt(rest[11], 10) || 0;
+    const stime = parseInt(rest[12], 10) || 0;
+    return utime + stime;
+  } catch (e) {
+    return null; // /proc/<pid> 不存在或读取失败
+  }
+}
+
+// 读 /proc/stat 第一行（cpu 开头），字段 2-5 user+nice+system+idle 求和为系统总时间
+function procTotalTicks() {
+  try {
+    const first = fs.readFileSync('/proc/stat', 'utf-8').split('\n')[0];
+    const cols = first.trim().split(/\s+/);
+    if (cols[0] !== 'cpu' || cols.length < 5) return null;
+    return (
+      (parseInt(cols[1], 10) || 0) +
+      (parseInt(cols[2], 10) || 0) +
+      (parseInt(cols[3], 10) || 0) +
+      (parseInt(cols[4], 10) || 0)
+    );
+  } catch (e) {
+    return null;
+  }
+}
+
 // 采集 TOP 内存进程（单列进程排行）：ps 按 RSS 降序取前 15。
 // 命名规则：pid 命中 systemd 主进程映射 → 服务名；未命中再按 comm/args 兜底分类
 // （opencode / agent-browser / node / python / 其他 comm）
@@ -883,6 +920,7 @@ async function collectProcesses() {
       "ps -eo pid,comm,rss,pcpu,args --sort=-rss | head -16 | tail -15",
       { encoding: 'utf-8' }
     );
+    const curTotal = procTotalTicks(); // 系统总时间，本次采样全局一致
     return out
       .trim()
       .split('\n')
@@ -907,11 +945,34 @@ async function collectProcesses() {
         } else {
           name = comm;
         }
+        // 进程瞬时 CPU：/proc/<pid>/stat 的 utime+stime 与上次差值 ÷ 系统总时间差值
+        const curCpu = procCpuTicks(pid);
+        let cpu;
+        if (curCpu !== null && curTotal !== null) {
+          const last = procCpuSample.get(pid);
+          if (last) {
+            const dTotal = curTotal - last.total;
+            if (dTotal > 0) {
+              cpu = Math.round(((curCpu - last.cpu) / dTotal) * 1000) / 10;
+            } else {
+              // 防除零：total 差值 ≤ 0 时返回上次瞬时值（无则 0）
+              cpu = last.pct != null ? last.pct : 0;
+            }
+          } else {
+            // 上次无采样：用 ps 的 pcpu 兜底
+            cpu = Math.round((parseFloat(m[3]) || 0) * 10) / 10;
+          }
+          procCpuSample.set(pid, { cpu: curCpu, total: curTotal, pct: cpu });
+        } else {
+          // 进程不存在（/proc/pid 读失败）：删除采样缓存，pcpu 兜底
+          procCpuSample.delete(pid);
+          cpu = Math.round((parseFloat(m[3]) || 0) * 10) / 10;
+        }
         return {
           name,
           pid,
           mem_mb: Math.round((parseInt(m[2], 10) || 0) / 1024),
-          cpu: Math.round((parseFloat(m[3]) || 0) * 10) / 10
+          cpu
         };
       })
       .filter(Boolean);
