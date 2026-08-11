@@ -825,8 +825,43 @@ app.get('/api/admin/services', authRequired, async (req, res) => {
   }
 });
 
-// 采集 TOP 内存进程（单列进程排行）：ps 按 RSS 降序取前 15
-function collectProcesses() {
+// systemd 服务清单：进程识别以 systemctl MainPID 为准（避免命令行参数含服务名造成误判），
+// 主 PID 非 0 则记录 pid → 服务名映射，供 collectProcesses 正规化命名
+const SYSTEMD_SERVICES = [
+  'admin-server',
+  'admin-server-test',
+  'blog-server',
+  'auth-server',
+  'deeptutor',
+  'cloudreve',
+  'alist',
+  'nginx',
+  'redis-server',
+  'hermes-gateway',
+  'hermes-serve'
+];
+
+// 采集 TOP 内存进程（单列进程排行）：ps 按 RSS 降序取前 15。
+// 命名规则：pid 命中 systemd 主进程映射 → 服务名；未命中再按 comm/args 兜底分类
+// （opencode / agent-browser / node / python / 其他 comm）
+async function collectProcesses() {
+  // 1. systemd 正规化：逐服务查 MainPID，非 0 则记录 pid→服务名映射
+  const pidToService = new Map();
+  await Promise.allSettled(
+    SYSTEMD_SERVICES.map(async (svc) => {
+      try {
+        const { stdout } = await execAsync(`systemctl show ${svc} -p MainPID --value`, {
+          encoding: 'utf-8',
+          timeout: 3000
+        });
+        const pid = parseInt(stdout.trim(), 10);
+        if (pid > 0) pidToService.set(pid, svc);
+      } catch (e) {
+        // 单位不存在/查询失败：跳过，该进程走兜底分类
+      }
+    })
+  );
+
   try {
     const out = execSync(
       "ps -eo pid,comm,rss,pcpu,args --sort=-rss | head -16 | tail -15",
@@ -838,30 +873,28 @@ function collectProcesses() {
       .map((line) => {
         const m = line.trim().split(/\s+/);
         if (m.length < 5) return null;
-        const memMb = Math.round((parseInt(m[2], 10) || 0) / 1024);
-        const args = m.slice(4).join(' ');
-        // 进程命名：优先匹配特征明显的关键字，避免任务描述路径中的服务名造成误判
-        let name = m[1];
         const pid = parseInt(m[0], 10);
-        if (args.includes('opencode')) name = 'opencode';
-        else if (args.includes('node') && args.includes('agent-browser')) name = 'agent-browser';
-        else if (args.includes('gateway run')) name = 'hermes-gateway';
-        else if (args.includes('hermes serve')) name = 'hermes-serve';
-        else if (args.includes('node') && args.includes('blog')) name = 'blog-server';
-        else if (args.includes('node') && args.includes('admin-server')) name = 'admin-server';
-        else if (args.includes('node') && args.includes('src/index.js')) {
-          // admin-server 实际启动 args 不含 'admin-server' 字样：读 /proc/<pid>/cwd 判定
-          try {
-            const cwd = fs.readlinkSync(`/proc/${pid}/cwd`);
-            name = cwd === '/root/proj/admin-server' ? 'admin-server' : 'node';
-          } catch (e) {
-            name = 'node';
-          }
+        const comm = m[1];
+        const args = m.slice(4).join(' ');
+        // 进程命名：优先 systemd 主 PID 精确匹配，未命中按 comm/args 兜底分类
+        let name;
+        if (pidToService.has(pid)) {
+          name = pidToService.get(pid);
+        } else if (comm === 'opencode' || args.includes('opencode')) {
+          name = 'opencode';
+        } else if (comm === 'agent-browser' || args.includes('agent-browser')) {
+          name = 'agent-browser';
+        } else if (comm === 'node' || args.includes('node')) {
+          name = 'node';
+        } else if (/^python/.test(comm)) {
+          name = 'python';
+        } else {
+          name = comm;
         }
         return {
           name,
-          pid: parseInt(m[0], 10),
-          mem_mb: memMb,
+          pid,
+          mem_mb: Math.round((parseInt(m[2], 10) || 0) / 1024),
           cpu: Math.round((parseFloat(m[3]) || 0) * 10) / 10
         };
       })
