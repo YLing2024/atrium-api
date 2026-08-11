@@ -725,36 +725,109 @@ app.get('/api/admin/system/history', authRequired, (req, res) => {
 
 // 软件版本监控（需鉴权）：采集所有关键软件/服务版本
 const NODE_BIN = '/root/.nvm/versions/node/v24.19.0/bin';
+// execSync 以 sh 执行命令：systemd 环境 PATH 不含 node bin，npm CLI 的 shebang 依赖 env node，
+// 故所有 latestCmd 统一加完整 PATH 前缀
+const CMD_PATH = `PATH=${NODE_BIN}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`;
+const LATEST_TTL = 6 * 60 * 60 * 1000; // 最新版本缓存 6 小时
+const latestCache = new Map(); // name -> { ts, value }
+
+// 版本清洗：去 v/V 前缀、去开头的 epoch（形如 '5:8.0.2-3+deb13u2'，仅当最前为数字+冒号）、
+// 取第一个 '-' 前的主版本段。例：'5:8.0.2-3+deb13u2' → '8.0.2'；'v24.19.0' → '24.19.0'
+function stripVersion(v) {
+  return String(v || '')
+    .trim()
+    .replace(/^[vV]/, '')
+    .replace(/^\d+:/, '')
+    .split('-')[0]
+    .trim();
+}
+
+// 获取最新版本：manual 模式不自动对照（latest 恒 '—'）；
+// latestCmd 为空/执行失败/输出为空时返回 '—'，成功结果缓存 6 小时（key=name）
+function getLatestVersion(v) {
+  if (v.compareMode === 'manual') return '—';
+  if (!v.latestCmd) return '—';
+  const cached = latestCache.get(v.name);
+  if (cached && Date.now() - cached.ts < LATEST_TTL) return cached.value;
+  try {
+    const out = execSync(`${CMD_PATH} ${v.latestCmd}`, { encoding: 'utf-8', timeout: 10000 })
+      .trim()
+      .split('\n')[0];
+    if (!out) return '—';
+    latestCache.set(v.name, { ts: Date.now(), value: out });
+    return out;
+  } catch (e) {
+    return '—';
+  }
+}
+
+// 版本相等比较：两侧均先 stripVersion 清洗，取首个 x.y.z 数字序列按 . 分段比较；
+// 任一侧无版本号则视为不相等
+function versionEqual(a, b) {
+  const nums = (s) => {
+    const m = stripVersion(s).match(/\d+(?:\.\d+)*/);
+    return m ? m[0].split('.').map((p) => parseInt(p, 10) || 0) : null;
+  };
+  const pa = nums(a);
+  const pb = nums(b);
+  if (!pa || !pb) return false;
+  const len = Math.max(pa.length, pb.length);
+  for (let i = 0; i < len; i++) {
+    if ((pa[i] || 0) !== (pb[i] || 0)) return false;
+  }
+  return true;
+}
+
 const VERSION_CHECKS = [
-  { name: 'Node.js', category: 'runtime', cmd: `${NODE_BIN}/node --version` },
-  { name: 'npm', category: 'runtime', cmd: `PATH=${NODE_BIN}:$PATH ${NODE_BIN}/npm --version` },
-  { name: 'Python', category: 'runtime', cmd: 'python3 --version' },
-  { name: 'nginx', category: 'runtime', cmd: 'nginx -v 2>&1' },
-  { name: 'Redis', category: 'runtime', cmd: 'redis-server --version' },
-  { name: 'Hermes', category: 'service', cmd: '/usr/local/bin/hermes --version' },
-  { name: 'Cloudreve', category: 'service', cmd: "curl -s --max-time 3 http://127.0.0.1:5212/api/v4/site/ping | python3 -c \"import json,sys; print('v'+json.load(sys.stdin)['data'])\"" },
-  { name: 'Alist', category: 'service', cmd: '/root/proj/alist/alist version' },
-  { name: 'DeepTutor', category: 'service', cmd: '/root/proj/deeptutor/.venv/bin/pip show deeptutor | grep -m1 Version' },
-  { name: '系统内核', category: 'system', cmd: 'uname -r' },
-  { name: '操作系统', category: 'system', cmd: 'cat /etc/os-release | grep PRETTY_NAME | cut -d\\" -f2' },
+  { name: 'Node.js', category: 'runtime', cmd: `${NODE_BIN}/node --version`, latestCmd: `${NODE_BIN}/npm view node version` },
+  { name: 'npm', category: 'runtime', cmd: `PATH=${NODE_BIN}:$PATH ${NODE_BIN}/npm --version`, latestCmd: `${NODE_BIN}/npm view npm version` },
+  { name: 'Python', category: 'runtime', cmd: 'python3 --version', latestCmd: 'apt-cache policy python3.13 2>/dev/null | awk \'/Candidate:/{print $2; exit}\'' },
+  { name: 'nginx', category: 'runtime', cmd: 'nginx -v 2>&1', latestCmd: 'apt-cache policy nginx 2>/dev/null | awk \'/Candidate:/{print $2; exit}\'' },
+  { name: 'Redis', category: 'runtime', cmd: 'redis-server --version', latestCmd: 'apt-cache policy redis-server 2>/dev/null | awk \'/Candidate:/{print $2; exit}\'' },
+  { name: 'Hermes', category: 'service', compareMode: 'manual', cmd: '/usr/local/bin/hermes --version', latestCmd: '' },
+  { name: 'Cloudreve', category: 'service', cmd: "curl -s --max-time 3 http://127.0.0.1:5212/api/v4/site/ping | python3 -c \"import json,sys; print('v'+json.load(sys.stdin)['data'])\"", latestCmd: "curl -s --max-time 8 -H 'User-Agent: admin-server' https://api.github.com/repos/cloudreve/Cloudreve/releases/latest | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"tag_name\"])'" },
+  { name: 'Alist', category: 'service', cmd: '/root/proj/alist/alist version | grep -m1 \'^Version:\'', latestCmd: "curl -s --max-time 8 -H 'User-Agent: admin-server' https://api.github.com/repos/AlistGo/alist/releases/latest | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"tag_name\"])'" },
+  { name: 'DeepTutor', category: 'service', cmd: '/root/proj/deeptutor/.venv/bin/pip show deeptutor | grep -m1 Version', latestCmd: "curl -s --max-time 8 https://pypi.org/pypi/deeptutor/json | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"info\"][\"version\"])'" },
+  { name: '系统内核', category: 'system', cmd: 'uname -r', latestCmd: 'apt-cache policy linux-image-amd64 2>/dev/null | awk \'/Candidate:/{print $2; exit}\'' },
+  { name: '操作系统', category: 'system', cmd: 'cat /etc/os-release | grep PRETTY_NAME | cut -d\\" -f2', latestCmd: '' },
+  { name: 'OpenSSL', category: 'system', cmd: 'openssl version -a', latestCmd: 'apt-cache policy openssl 2>/dev/null | awk \'/Candidate:/{print $2; exit}\'' },
+  { name: 'git', category: 'system', cmd: 'git --version', latestCmd: 'apt-cache policy git 2>/dev/null | awk \'/Candidate:/{print $2; exit}\'' },
+  { name: 'curl', category: 'system', cmd: 'curl --version', latestCmd: 'apt-cache policy curl 2>/dev/null | awk \'/Candidate:/{print $2; exit}\'' },
+  { name: 'certbot', category: 'system', cmd: 'certbot --version', latestCmd: 'apt-cache policy certbot 2>/dev/null | awk \'/Candidate:/{print $2; exit}\'' },
+  { name: 'ffmpeg', category: 'system', cmd: 'ffmpeg -version', latestCmd: 'apt-cache policy ffmpeg 2>/dev/null | awk \'/Candidate:/{print $2; exit}\'' },
+  { name: 'bash', category: 'system', cmd: 'bash --version', latestCmd: 'apt-cache policy bash 2>/dev/null | awk \'/Candidate:/{print $2; exit}\'' },
+  { name: 'make', category: 'system', cmd: 'make --version', latestCmd: 'apt-cache policy make 2>/dev/null | awk \'/Candidate:/{print $2; exit}\'' },
+  { name: 'nano', category: 'system', cmd: 'nano --version', latestCmd: 'apt-cache policy nano 2>/dev/null | awk \'/Candidate:/{print $2; exit}\'' },
+  { name: 'systemd', category: 'system', cmd: 'systemctl --version', latestCmd: 'apt-cache policy systemd 2>/dev/null | awk \'/Candidate:/{print $2; exit}\'' },
+  { name: 'OpenSSH', category: 'system', cmd: 'ssh -V 2>&1', latestCmd: 'apt-cache policy openssh-server 2>/dev/null | awk \'/Candidate:/{print $2; exit}\'' },
+  { name: 'ca-certificates', category: 'system', cmd: 'dpkg -s ca-certificates | grep -m1 ^Version | awk \'{print $2}\'', latestCmd: 'apt-cache policy ca-certificates 2>/dev/null | awk \'/Candidate:/{print $2; exit}\'' },
 ];
 
 app.get('/api/admin/versions', authRequired, async (req, res) => {
   const results = [];
   for (const v of VERSION_CHECKS) {
+    let version;
+    let ok = true;
     try {
-      const out = execSync(v.cmd, { encoding: 'utf-8', timeout: 8000 })
+      version = execSync(v.cmd, { encoding: 'utf-8', timeout: 8000 })
         .trim()
         .split('\n')[0];
-      results.push({ name: v.name, category: v.category, version: out || '未知', ok: true });
     } catch (e) {
-      results.push({
-        name: v.name,
-        category: v.category,
-        version: String(e.stderr || e.message || '').trim().split('\n')[0] || '不可用',
-        ok: false,
-      });
+      version = String(e.stderr || e.message || '').trim().split('\n')[0] || '不可用';
+      ok = false;
     }
+    const latest = getLatestVersion(v);
+    results.push({
+      name: v.name,
+      category: v.category,
+      version: version || '未知',
+      ok,
+      latest,
+      // manual（如 Hermes 双版本体系）不自动比较，恒视为最新避免误报；
+      // 其余仅当最新版本可获取且清洗后相等才算最新
+      upToDate:
+        v.compareMode === 'manual' || latest === '—' || versionEqual(version, latest),
+    });
   }
   res.json({ list: results });
 });
