@@ -742,10 +742,9 @@ function stripVersion(v) {
     .trim();
 }
 
-// 获取最新版本：manual 模式不自动对照（latest 恒 '—'）；
-// latestCmd 为空/执行失败/输出为空时返回 '—'，成功结果缓存 6 小时（key=name）
+// 获取最新版本：latestCmd 为空/执行失败/输出为空时返回 '—'，成功结果缓存 6 小时（key=name）。
+// manual 模式仅表示不参与 upToDate 判定（由调用方恒视为最新），latest 同样拉取展示
 function getLatestVersion(v) {
-  if (v.compareMode === 'manual') return '—';
   if (!v.latestCmd) return '—';
   const cached = latestCache.get(v.name);
   if (cached && Date.now() - cached.ts < LATEST_TTL) return cached.value;
@@ -782,7 +781,9 @@ const VERSION_CHECKS = [
   { name: 'Node.js', category: 'runtime', cmd: `${NODE_BIN}/node --version`, latestCmd: `${NODE_BIN}/npm view node version` },
   { name: 'npm', category: 'runtime', cmd: `PATH=${NODE_BIN}:$PATH ${NODE_BIN}/npm --version`, latestCmd: `${NODE_BIN}/npm view npm version` },
   { name: 'Python', category: 'runtime', cmd: "python3 --version 2>&1 | awk '{print $2}'", latestCmd: 'apt-cache policy python3.13 2>/dev/null | awk \'/Candidate:/{print $2; exit}\'' },
-  { name: 'Hermes', category: 'service', compareMode: 'manual', cmd: "/usr/local/bin/hermes version 2>/dev/null | head -1 | grep -oE 'v[0-9.]+' | head -1 | sed 's/^v//'", latestCmd: '' },
+  { name: 'Hermes', category: 'service', compareMode: 'manual', cmd: "/usr/local/bin/hermes version 2>/dev/null | head -1 | grep -oE 'v[0-9.]+' | head -1 | sed 's/^v//'", latestCmd: "curl -s --max-time 8 -H 'User-Agent: admin-server' https://api.github.com/repos/NousResearch/hermes-agent/releases/latest | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"tag_name\"])'" },
+  { name: 'OpenCode', category: 'service', cmd: '/root/.nvm/versions/node/v24.19.0/bin/opencode --version 2>/dev/null | head -1', latestCmd: "curl -s --max-time 8 https://registry.npmjs.org/opencode-ai/latest | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"version\"])'" },
+  { name: 'dida-cli', category: 'service', cmd: "cat /root/.nvm/versions/node/v24.19.0/lib/node_modules/@suibiji/dida-cli/package.json | grep -m1 \"version\" | grep -oE '[0-9]+\\.[0-9]+\\.[0-9]+'", latestCmd: "curl -s --max-time 8 https://registry.npmjs.org/@suibiji/dida-cli/latest | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"version\"])'" },
   { name: 'Cloudreve', category: 'service', cmd: "curl -s --max-time 3 http://127.0.0.1:5212/api/v4/site/ping | python3 -c \"import json,sys; print('v'+json.load(sys.stdin)['data'])\"", latestCmd: "curl -s --max-time 8 -H 'User-Agent: admin-server' https://api.github.com/repos/cloudreve/Cloudreve/releases/latest | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"tag_name\"])'" },
   { name: 'Alist', category: 'service', cmd: "/root/proj/alist/alist version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1 | sed 's/^v//'", latestCmd: "curl -s --max-time 8 -H 'User-Agent: admin-server' https://api.github.com/repos/AlistGo/alist/releases/latest | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"tag_name\"])'" },
   { name: 'DeepTutor', category: 'service', cmd: '/root/proj/deeptutor/.venv/bin/pip show deeptutor | grep -m1 Version | awk \'{print $2}\'', latestCmd: "curl -s --max-time 8 https://pypi.org/pypi/deeptutor/json | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"info\"][\"version\"])'" },
@@ -805,9 +806,11 @@ app.get('/api/admin/versions', authRequired, async (req, res) => {
     results.push({
       name: v.name,
       category: v.category,
-      version: version || '未知',
+      // version / latest 显示前统一过 stripVersion 清洗：去 v/V 前缀、去 epoch、取 '-' 前主版本段，
+      // 保证所有条目格式一致（如 24.19.0 / 11.17.0 / 3.13.5 / 2026.8.3）
+      version: stripVersion(version) || '未知',
       ok,
-      latest,
+      latest: stripVersion(latest),
       // manual（如 Hermes 双版本体系）不自动比较，恒视为最新避免误报；
       // 其余仅当最新版本可获取且清洗后相等才算最新
       upToDate:
