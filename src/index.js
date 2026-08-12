@@ -722,6 +722,40 @@ function forwardTotp(path) {
 app.post('/api/admin/totp/reset', forwardTotp('/api/totp/reset'));
 app.post('/api/admin/totp/confirm', forwardTotp('/api/totp/confirm'));
 
+// 已登录设备管理：转发到认证中心 /api/sessions*（列表 / 重命名 / 删除）。
+// 方法/query/Authorization 透传；GET 无 body，PUT/DELETE 带 JSON body；
+// token 同时拼到 query（认证中心兼容 header / query 两种透传）
+function forwardSessions(req, res) {
+  const ip = clientIp(req);
+  const url = new URL(AUTH_CENTER_BASE_URL + '/api/sessions' + req.path);
+  const header = req.headers.authorization || '';
+  const headerToken = header.startsWith('Bearer ') ? header.slice(7).trim() : null;
+  const queryToken = req.query && req.query.token ? String(req.query.token) : null;
+  const token = headerToken || queryToken;
+  if (token) url.searchParams.set('token', token); // 认证中心兼容 header / query 两种透传
+  const headers = { Accept: 'application/json' };
+  if (headerToken) headers.Authorization = header;
+  const opts = { method: req.method, headers, signal: AbortSignal.timeout(5000) };
+  if (req.method !== 'GET' && req.method !== 'HEAD') {
+    headers['Content-Type'] = 'application/json';
+    opts.body = JSON.stringify(req.body || {});
+  }
+  const action =
+    req.method === 'GET' ? 'list' : req.method === 'PUT' ? 'rename' : req.method === 'DELETE' ? 'delete' : req.method.toLowerCase();
+  fetch(url, opts)
+    .then(async (upstream) => {
+      const data = await upstream.json().catch(() => ({}));
+      auditLog('sessions_' + action, ip, upstream.ok, '转发认证中心');
+      return res.status(upstream.status).json(data);
+    })
+    .catch((e) => {
+      auditLog('sessions_' + action, ip, false, '认证中心不可达: ' + e.message);
+      return res.status(502).json({ error: '认证中心不可达' });
+    });
+}
+
+app.use('/api/admin/sessions', authRequired, forwardSessions);
+
 // TOTP 首次设置：挂载 totp-auth 模块路由（无鉴权，secret 已配置则 409）
 app.use('/api/admin/totp', (req, res, next) => {
   const ip = clientIp(req);
