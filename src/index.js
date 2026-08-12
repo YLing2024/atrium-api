@@ -2,8 +2,7 @@
 
 /**
  * admin-server 入口
- *  - REST 接口：登录 / 系统信息 / 上传 / 下载 / 修改密码
- *  - WebSocket 桥接：客户端 <-> Hermes(9119) 双向透传 JSON-RPC 帧
+ *  - REST 接口：登录 / 系统信息 / 上传 / 下载 / 修改密码 / 历史记录浏览（只读）
  */
 
 const fs = require('fs');
@@ -15,19 +14,19 @@ const { promisify } = require('util');
 const execAsync = promisify(exec);
 const crypto = require('crypto');
 const express = require('express');
-const http = require('http');
 const net = require('net');
 const Redis = require('ioredis');
 const multer = require('multer');
-const { WebSocketServer, WebSocket } = require('ws');
+const { DatabaseSync } = require('node:sqlite');
 const { createTotpAuth } = require('totp-auth');
 const config = require('./config');
 
 const PORT = parseInt(process.env.PORT, 10) || 3100;
 const HOST = process.env.HOST || '0.0.0.0';
 const UPLOAD_DIR = process.env.ADMIN_UPLOAD_DIR || path.join(__dirname, '..', 'uploads'); // 上传文件目录
-const HERMES_WS_URL = 'ws://127.0.0.1:9119/api/ws'; // Hermes WebSocket 网关
-const HERMES_TOKEN_FILE = '/root/.hermes/dashboard_token'; // Hermes 访问令牌
+// Hermes 会话数据库（只读浏览历史记录用）；默认取本机 Hermes state.db，可被环境变量覆盖（测试实例隔离）
+const HERMES_STATE_DB =
+  process.env.HERMES_STATE_DB || path.join(os.homedir(), '.hermes', 'state.db');
 
 // 多会话：Redis key 带 token 后缀（admin:session:<token>），每个会话独立，多端可同时登录
 const SESSION_KEY_PREFIX = process.env.ADMIN_REDIS_PREFIX || 'admin:session:';
@@ -96,15 +95,6 @@ function clientIp(req) {
   return req.ip || (req.socket && req.socket.remoteAddress) || 'unknown';
 }
 
-// 内部通知接口来源校验：设置 ADMIN_NOTIFY_KEY 后，携带匹配密钥的请求可从任意来源调用；
-// 未设置时仅允许本机回环地址（::ffff:127.0.0.1 是 IPv4 映射 IPv6 的形式）
-const ADMIN_NOTIFY_KEY = process.env.ADMIN_NOTIFY_KEY || '';
-
-function isLoopbackAddr(addr) {
-  const a = String(addr || '');
-  return a === '127.0.0.1' || a === '::1' || a === '::ffff:127.0.0.1';
-}
-
 // Redis 连接，失败时启动报错退出
 const redis = new Redis('redis://127.0.0.1:6379');
 redis.on('error', (err) => {
@@ -153,22 +143,9 @@ const auth = createTotpAuth({
   rateLimit: { maxFailures: 5, lockout: [60, 300, 900] },
 });
 
-// 认证中心地址：WS 鉴权与 SSO 兼容接口共用
+// 认证中心地址：SSO 兼容接口（/api/admin/sso/verify）校验用
 const AUTH_CENTER_VERIFY_URL =
   process.env.AUTH_CENTER_VERIFY_URL || 'http://127.0.0.1:3200/api/verify';
-
-// 调认证中心内部接口验证 token，返回是否通过
-async function verifyAuthCenterToken(token) {
-  try {
-    const res = await fetch(
-      `${AUTH_CENTER_VERIFY_URL}?token=${encodeURIComponent(token)}`,
-      { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(3000) }
-    );
-    return res.ok;
-  } catch (e) {
-    return false;
-  }
-}
 
 // 鉴权中间件：
 //  主鉴权 —— 信任 Nginx 探针注入的 X-Auth-User header（认证中心已验证，内网可信），
@@ -1135,172 +1112,101 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: '服务器内部错误' });
 });
 
-/* ============ WebSocket 桥接 ============ */
+/* ============ 历史记录浏览（只读） ============ */
 
-const server = http.createServer(app);
-const wss = new WebSocketServer({ server, path: '/api/admin/ws' });
-
-// 从 query 或 Sec-WebSocket-Protocol 中取 token
-function extractToken(req) {
-  const url = new URL(req.url, 'http://localhost');
-  const q = url.searchParams.get('token');
-  if (q) return q;
-  const proto = req.headers['sec-websocket-protocol'];
-  if (proto) return proto.split(',')[0].trim();
-  return null;
-}
-
-wss.on('connection', async (ws, req) => {
-  // 1. 鉴权：优先用 query token 调认证中心 /api/verify 验证（通过即连接）；
-  //    失败（token 非认证中心签发/认证中心不可达）降级回旧 Redis 会话校验，兼容过渡期
-  const token = extractToken(req);
-  if (!token) {
-    ws.close(4001, 'missing token');
-    return;
-  }
-  const authOk = await verifyAuthCenterToken(token);
-  if (!authOk) {
-    try {
-      const stored = await redis.get(sessionKey(token));
-      if (!stored || stored !== token) {
-        ws.close(4001, 'invalid token');
-        return;
-      }
-      await redis.expire(sessionKey(token), SESSION_TTL); // 滑动续期
-    } catch (e) {
-      ws.close(4001, 'redis error');
-      return;
-    }
-  }
-
-  // 2. 读取 Hermes 令牌并连接网关
-  let hermesToken = '';
+// 只读历史会话列表：数据源为 Hermes state.db（以 readOnly 打开），
+// 每次请求独立 open → query → close，避免长期占用 WAL 锁（Hermes 网关并发写同一库）。
+// 数据库不可用仅影响本接口，不影响其它接口与进程启动
+app.get('/api/admin/history', authRequired, (req, res) => {
+  const ip = clientIp(req);
+  let db;
   try {
-    hermesToken = fs.readFileSync(HERMES_TOKEN_FILE, 'utf-8').trim();
+    db = new DatabaseSync(HERMES_STATE_DB, { readOnly: true });
   } catch (e) {
-    ws.close(5000, 'hermes token missing');
-    return;
+    auditLog('history_list', ip, false, '数据库不可用: ' + e.message);
+    return res.status(503).json({ error: '历史记录暂不可用' });
   }
-  const hermes = new WebSocket(
-    `${HERMES_WS_URL}?token=${encodeURIComponent(hermesToken)}`
-  );
-
-  // 3. 客户端消息缓冲队列：hermes 尚未 OPEN 时先入队，onopen 后按序 flush，
-  //    避免客户端连接后立即发 JSON-RPC 请求被静默丢弃导致永久超时
-  const pending = [];
-
-  const sendToHermes = (raw) => {
-    if (hermes.readyState === WebSocket.OPEN) {
-      hermes.send(raw);
-      return true;
-    }
-    return false;
-  };
-
-  // 按序 flush 缓冲队列（hermes 中途断开则停在原地，留给 onclose 兜底）
-  const flushPending = () => {
-    while (pending.length && sendToHermes(pending[0])) {
-      pending.shift();
-    }
-  };
-
-  // 尽量从原始帧中解析出 JSON-RPC id（解析失败视为通知帧，不回 error）
-  const getRpcId = (raw) => {
+  try {
+    const rows = db
+      .prepare(
+        `SELECT id, title, display_name, started_at, last_activity_at, message_count, session_key
+         FROM sessions ORDER BY last_activity_at DESC`
+      )
+      .all();
+    const sessions = rows.map((r) => {
+      const title = r.title || r.display_name || r.id;
+      const raw = r.last_activity_at != null ? r.last_activity_at : r.started_at;
+      return {
+        id: r.id,
+        title,
+        time: raw != null ? Math.round(raw * 1000) : null,
+        message_count: r.message_count
+      };
+    });
+    auditLog('history_list', ip, true, `sessions=${sessions.length}`);
+    res.json({ sessions });
+  } catch (e) {
+    auditLog('history_list', ip, false, e.message);
+    res.status(500).json({ error: '获取历史会话失败' });
+  } finally {
     try {
-      const m = JSON.parse(raw);
-      return m && m.id != null ? m.id : undefined;
+      db.close();
     } catch (e) {
-      return undefined;
+      // 关闭失败忽略
     }
-  };
-
-  // 上游连接失败/关闭：给缓冲中的请求逐个回 JSON-RPC error，避免客户端永久超时
-  const failPending = (reason) => {
-    let item;
-    while ((item = pending.shift()) !== undefined) {
-      const id = getRpcId(item);
-      if (id !== undefined && ws.readyState === WebSocket.OPEN) {
-        ws.send(
-          JSON.stringify({ jsonrpc: '2.0', id, error: { code: -32000, message: reason } })
-        );
-      }
-    }
-  };
-
-  // 4. 双向透传：JSON 行原样转发
-  ws.on('message', (data) => {
-    const raw = data.toString();
-    if (!sendToHermes(raw)) {
-      pending.push(raw); // hermes 未就绪：缓冲等待 flush
-    }
-  });
-  hermes.on('message', (data) => {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(data.toString());
-    }
-  });
-
-  hermes.on('open', flushPending);
-
-  // 5. 任一端断开即关闭对端
-  const closeBoth = (reason) => {
-    if (pending.length) failPending(reason || '上游连接已断开');
-    if (ws.readyState === WebSocket.OPEN) ws.close();
-    if (hermes.readyState === WebSocket.OPEN) hermes.close();
-  };
-  ws.on('close', () => closeBoth('客户端已断开'));
-  ws.on('error', () => closeBoth('客户端连接异常'));
-  hermes.on('close', () => closeBoth('Hermes 连接已关闭'));
-  hermes.on('error', (err) =>
-    closeBoth('Hermes 连接失败: ' + ((err && err.message) || '未知错误'))
-  );
+  }
 });
 
-/* ============ 内部通知（外部平台消息实时通知） ============ */
-
-// 向所有已连接的 WS 客户端广播事件帧（仅 OPEN 连接），返回送达连接数
-function broadcastEvent(type, payload) {
-  const frame = JSON.stringify({
-    jsonrpc: '2.0',
-    method: 'event',
-    params: { type, payload }
-  });
-  let sent = 0;
-  wss.clients.forEach((ws) => {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(frame);
-      sent++;
-    }
-  });
-  return sent;
-}
-
-// 内部通知接口：供 Hermes pre_gateway_dispatch hook 调用（本机回环 POST，无需 JWT）。
-// 校验通过后向所有在线前端 WS 客户端广播 admin.external_message 事件。
-app.post('/api/admin/notify', (req, res) => {
+// 只读单个会话消息：仅保留 user/assistant 角色，按 id 升序
+app.get('/api/admin/history/:id', authRequired, (req, res) => {
   const ip = clientIp(req);
-  const remote = req.socket && req.socket.remoteAddress;
-  const keyOk = !!ADMIN_NOTIFY_KEY && req.get('x-admin-notify-key') === ADMIN_NOTIFY_KEY;
-  if (!isLoopbackAddr(remote) && !keyOk) {
-    auditLog('notify', ip, false, '非本机来源被拒绝');
-    return res.status(403).json({ error: '仅允许本机或携带共享密钥调用' });
+  const id = req.params.id;
+  let db;
+  try {
+    db = new DatabaseSync(HERMES_STATE_DB, { readOnly: true });
+  } catch (e) {
+    auditLog('history_messages', ip, false, '数据库不可用: ' + e.message);
+    return res.status(503).json({ error: '历史记录暂不可用' });
   }
-  const { platform, chat_id, text } = req.body || {};
-  if (typeof chat_id !== 'string' || !chat_id || typeof text !== 'string') {
-    return res.status(400).json({ error: '缺少 chat_id 或 text' });
+  try {
+    const session = db
+      .prepare(`SELECT id, title, display_name FROM sessions WHERE id = ?`)
+      .get(id);
+    if (!session) {
+      auditLog('history_messages', ip, false, '会话不存在: ' + id);
+      return res.status(404).json({ error: '会话不存在' });
+    }
+    const rows = db
+      .prepare(
+        `SELECT role, content, timestamp FROM messages
+         WHERE session_id = ? AND role IN ('user','assistant') ORDER BY id ASC`
+      )
+      .all(id);
+    const messages = rows.map((r) => ({
+      role: r.role,
+      content: r.content,
+      ts: r.timestamp != null ? Math.round(r.timestamp * 1000) : null
+    }));
+    auditLog('history_messages', ip, true, `session=${id} messages=${messages.length}`);
+    res.json({
+      session: { id: session.id, title: session.title || session.display_name || session.id },
+      messages
+    });
+  } catch (e) {
+    auditLog('history_messages', ip, false, e.message);
+    res.status(500).json({ error: '获取会话消息失败' });
+  } finally {
+    try {
+      db.close();
+    } catch (e) {
+      // 关闭失败忽略
+    }
   }
-  const sent = broadcastEvent('admin.external_message', {
-    platform: typeof platform === 'string' && platform ? platform : 'weixin',
-    chat_id,
-    text
-  });
-  auditLog('notify', ip, true, `platform=${platform} chat=${chat_id} sent=${sent}`);
-  res.json({ ok: true, sent });
 });
 
 /* ============ 启动 ============ */
 
-server.listen(PORT, HOST, () => {
+app.listen(PORT, HOST, () => {
   console.log(`[admin-server] 已启动，监听地址: ${HOST}:${PORT}`);
   console.log(`[admin-server] 上传目录: ${UPLOAD_DIR}`);
   console.log(`[admin-server] 配置文件: ${config.CONFIG_PATH}`);
