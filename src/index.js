@@ -965,9 +965,9 @@ app.get('/api/admin/system/stream', authRequired, (req, res) => {
     }
   }
 
-  // 连接建立后立即推送第一条，之后每 3s 推送
+  // 连接建立后立即推送第一条，之后每 1s 推送
   push();
-  const timer = setInterval(push, 3000);
+  const timer = setInterval(push, 1000);
 
   // 客户端断开 / 切走 Tab：停表，不再推送
   req.on('close', () => clearInterval(timer));
