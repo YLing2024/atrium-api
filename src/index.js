@@ -895,17 +895,28 @@ app.use('/api/admin/totp', (req, res, next) => {
   next();
 }, auth.router);
 
+// 组装系统信息（REST 端点与 SSE 快照共用）：实时采集系统信息，
+// 请求驱动同步写入历史 buffer，保证趋势图与上方实时数据同源
+async function buildSystemPayload() {
+  const data = await collectSystem();
+  try {
+    sampleHistory();
+  } catch {
+    /* 采样失败不影响主响应 */
+  }
+  return data;
+}
+
+// 组装服务状态（REST 端点与 SSE 快照共用）
+async function buildServicesPayload() {
+  const [services, result] = await Promise.all([collectServices(), collectProcesses()]);
+  return { services, processes: result.processes, total_cpu: result.total_cpu };
+}
+
 // 系统信息（需鉴权）。每次请求实时采集，无缓存
 app.get('/api/admin/system', authRequired, async (req, res) => {
   try {
-    const data = await collectSystem();
-    // 请求驱动：每次实时采样也写入历史 buffer，趋势图与上方实时数据同源
-    try {
-      sampleHistory();
-    } catch {
-      /* 采样失败不影响主响应 */
-    }
-    res.json(data);
+    res.json(await buildSystemPayload());
   } catch (e) {
     res.status(500).json({ error: '获取系统信息失败: ' + e.message });
   }
@@ -914,6 +925,52 @@ app.get('/api/admin/system', authRequired, async (req, res) => {
 // 历史采样（需鉴权）。返回环形 buffer 中的采样点（最多 120 点），多实例共享
 app.get('/api/admin/system/history', authRequired, (req, res) => {
   res.json(readHistory());
+});
+
+// SSE 实时快照（需鉴权）：系统信息 + 服务状态 + 历史采样合并推送。
+// 前端「系统」Tab 激活时才建连、切走即断开（req close 停表），替代前端三组 1s 轮询。
+app.get('/api/admin/system/stream', authRequired, (req, res) => {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no' // 禁 nginx 缓冲，保证实时
+  });
+  res.flushHeaders();
+
+  let tick = 0;
+  let pushing = false;
+
+  // 单条 snapshot：system / services / history 一次组装推送；
+  // pushing 防抖避免采集慢于推送间隔时 setInterval 重叠堆积
+  async function push() {
+    if (pushing) return;
+    pushing = true;
+    try {
+      const [system, services, history] = await Promise.all([
+        buildSystemPayload(),
+        buildServicesPayload(),
+        Promise.resolve(readHistory())
+      ]);
+      res.write(
+        'event: snapshot\ndata: ' + JSON.stringify({ system, services, history }) + '\n\n'
+      );
+      tick += 1;
+      // 每 10 tick（约 30s）补一条注释行，防代理超时
+      if (tick % 10 === 0) res.write(': ping\n\n');
+    } catch (e) {
+      // 单次采集失败不中断流，下个 tick 重试
+    } finally {
+      pushing = false;
+    }
+  }
+
+  // 连接建立后立即推送第一条，之后每 3s 推送
+  push();
+  const timer = setInterval(push, 3000);
+
+  // 客户端断开 / 切走 Tab：停表，不再推送
+  req.on('close', () => clearInterval(timer));
 });
 
 // 软件版本监控（需鉴权）：只采集本地当前版本，不查外部 latest 接口
@@ -992,8 +1049,7 @@ app.get('/api/admin/versions', authRequired, async (req, res) => {
 // collectProcesses 内部做单次 /proc 全量遍历，进程 cpu 与 total_cpu 同源同基准
 app.get('/api/admin/services', authRequired, async (req, res) => {
   try {
-    const [services, result] = await Promise.all([collectServices(), collectProcesses()]);
-    res.json({ services, processes: result.processes, total_cpu: result.total_cpu });
+    res.json(await buildServicesPayload());
   } catch (e) {
     res.status(500).json({ error: '获取服务状态失败: ' + e.message });
   }
