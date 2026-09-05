@@ -352,18 +352,123 @@ function getDiskIoInfo() {
   return info;
 }
 
+// 解析 /proc/meminfo（单位 kB → bytes）。任一字段缺失回退 os.*，整体失败回退全部 os.*。
+// 现文件若干函数直接读 /proc，此处同样直接读文件（fs.existsSync + try/catch 容错，代价可忽略）。
+// 返回 { total, used, free, available, buffCache, swapTotal, swapUsed, swapFree }
+function readMeminfo() {
+  let info = {};
+  try {
+    if (fs.existsSync('/proc/meminfo')) {
+      const text = fs.readFileSync('/proc/meminfo', 'utf-8');
+      for (const line of text.split('\n')) {
+        const m = line.match(/^(\w+):\s+(\d+)\s*kB/);
+        if (m) info[m[1]] = parseInt(m[2], 10) * 1024;
+      }
+    }
+  } catch (e) {
+    info = {};
+  }
+  const fallbackTotal = os.totalmem();
+  const fallbackFree = os.freemem();
+  const total = info.MemTotal || fallbackTotal;
+  const free = info.MemFree != null ? info.MemFree : fallbackFree;
+  const available = info.MemAvailable != null ? info.MemAvailable : null;
+  const buffCache =
+    info.Buffers != null && info.Cached != null ? info.Buffers + info.Cached : null;
+  const swapTotal = info.SwapTotal != null ? info.SwapTotal : 0;
+  const swapFree = info.SwapFree != null ? info.SwapFree : 0;
+  const used = total - free;
+  const swapUsed = swapTotal - swapFree;
+  return {
+    total,
+    used,
+    free,
+    available,
+    buffCache,
+    swapTotal,
+    swapUsed,
+    swapFree,
+    swapPercent: swapTotal > 0 ? Math.round((swapUsed / swapTotal) * 1000) / 10 : 0
+  };
+}
+
+// zram 明细：扫描 /sys/block/zram*，磁盘挂 zram 设备时返回首选压缩设备（zram0），
+// 其余（zram1/zram2…）仅并入总 swap（来自 /proc/meminfo）。无 zram 返回 null，不影响主流程。
+function getZram() {
+  try {
+    const blocks = fs.readdirSync('/sys/block');
+    const zramDevs = blocks.filter((name) => /^zram\d+$/.test(name)).sort();
+    if (!zramDevs.length) return null;
+
+    const comp = zramDevs[0]; // 主压缩设备（zram0）
+    const readInt = (f) => {
+      try {
+        return parseInt(fs.readFileSync(`/sys/block/${comp}/${f}`, 'utf-8').trim(), 10) || 0;
+      } catch (e) {
+        return 0;
+      }
+    };
+    let algorithm = null;
+    try {
+      const raw = fs
+        .readFileSync(`/sys/block/${comp}/comp_algorithm`, 'utf-8')
+        .trim();
+      const mm = raw.match(/\[([^\]]+)\]/);
+      algorithm = (mm ? mm[1] : raw.trim()) || null;
+    } catch (e) {
+      // 读取失败则 algorithm 保持 null
+    }
+    // mm_stat 的列定义（Linux zram 文档）：orig_data_size compr_data_size mem_used_total mem_limit
+    // mem_used_limit mem_used_max same_pages pages_compacted huge_pages。内核版本差异时 try/catch 兜底为 0。
+    let orig = 0;
+    let compr = 0;
+    let used = 0;
+    try {
+      const cols = fs.readFileSync(`/sys/block/${comp}/mm_stat`, 'utf-8').trim().split(/\s+/);
+      if (cols.length >= 3) {
+        orig = parseInt(cols[0], 10) || 0;
+        compr = parseInt(cols[1], 10) || 0;
+        used = parseInt(cols[2], 10) || 0;
+      }
+    } catch (e) {
+      orig = 0;
+      compr = 0;
+      used = 0;
+    }
+    // comprSize：有 mm_stat 用 compr_data_size；老内核无该文件时回退 mem_used_total（含元数据，近似值）
+    const comprSize = compr || readInt('mem_used_total') || used;
+    return {
+      total: readInt('disksize') || 0,
+      used,
+      origSize: orig || 0,
+      comprSize,
+      algorithm
+    };
+  } catch (e) {
+    return null;
+  }
+}
+
 // 采集系统信息（CPU 需 ~1s 双采样）
 async function collectSystem() {
-  const total = os.totalmem();
-  const free = os.freemem();
-  const used = total - free;
+  const mem = readMeminfo();
+  // 内存 percent：保留现有 used=total-free 语义（used/free 不变，历史曲线语义不动），
+  // 新增 available/buffCache/swap/zram 供前端明细展示
+  const percent = mem.total > 0 ? Math.round((mem.used / mem.total) * 1000) / 10 : 0;
   return {
     cpu: getCpuInfo(),
     memory: {
-      total,
-      used,
-      free,
-      percent: Math.round((used / total) * 1000) / 10
+      total: mem.total,
+      used: mem.used,
+      free: mem.free,
+      percent,
+      buffCache: mem.buffCache,
+      available: mem.available,
+      swapTotal: mem.swapTotal,
+      swapUsed: mem.swapUsed,
+      swapFree: mem.swapFree,
+      swapPercent: mem.swapPercent,
+      zram: getZram()
     },
     disk: getDisk(),
     network: getNetInfo(),
@@ -453,6 +558,25 @@ function memPercent() {
   return Math.round(((total - os.freemem()) / total) * 1000) / 10;
 }
 
+// swap 使用率（百分比，一位小数）：/proc/meminfo SwapTotal/SwapFree（含 zram+file+分区）；
+// 解析失败或总 swap 为 0 返回 0，不影响历史采样
+function swapPercent() {
+  try {
+    const info = {};
+    const text = fs.readFileSync('/proc/meminfo', 'utf-8');
+    for (const line of text.split('\n')) {
+      const m = line.match(/^(\w+):\s+(\d+)\s*kB/);
+      if (m) info[m[1]] = parseInt(m[2], 10) * 1024;
+    }
+    const total = info.SwapTotal || 0;
+    const free = info.SwapFree != null ? info.SwapFree : 0;
+    if (total <= 0) return 0;
+    return Math.round(((total - free) / total) * 1000) / 10;
+  } catch (e) {
+    return 0;
+  }
+}
+
 // 每次采样：CPU/内存为百分比，网速与磁盘 I/O 为两次采样差值换算的速率（字节/秒）。
 // 直接读原始计数（cpuSample/netSample/diskioSample），不扰动 /api/admin/system 的独立采样状态
 function sampleHistory() {
@@ -488,6 +612,7 @@ function sampleHistory() {
     ts: now,
     cpu: cpuPercent,
     mem_percent: memPercent(),
+    swap_percent: swapPercent(),
     net_rx_rate: Math.round(netRxRate),
     net_tx_rate: Math.round(netTxRate),
     disk_io_read: Math.round(ioReadRate),
