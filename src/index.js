@@ -449,6 +449,42 @@ function getZram() {
   }
 }
 
+// 解析单个 /proc/pressure/<type> 文件（格式：`some avg10=.. avg60=.. avg300=.. total=..` + full 行）。
+// 文件不存在/解析失败（老内核或容器无 PSI）返回 null，不影响主流程。
+function parsePressureFile(type) {
+  try {
+    if (!fs.existsSync(`/proc/pressure/${type}`)) return null;
+    const text = fs.readFileSync(`/proc/pressure/${type}`, 'utf-8');
+    const res = {};
+    for (const line of text.split('\n')) {
+      const m = line
+        .trim()
+        .match(/^(some|full)\s+avg10=([\d.]+)\s+avg60=([\d.]+)\s+avg300=([\d.]+)\s+total=(\d+)/);
+      if (!m) continue;
+      res[m[1]] = {
+        avg10: parseFloat(m[2]),
+        avg60: parseFloat(m[3]),
+        avg300: parseFloat(m[4]),
+        total: parseInt(m[5], 10)
+      };
+    }
+    return res.some && res.full ? res : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+// PSI（Pressure Stall Information）：进程因等内存/CPU/IO 被 stall 的时间占比。
+// some=至少一个任务被 stall，full=所有任务都被 stall（更严重）；avg 为滑动平均百分比，total 为累计微秒。
+// 返回 { memory, cpu, io }，各自 { some, full } 或 null（无 PSI 的资源）
+function readPressure() {
+  return {
+    memory: parsePressureFile('memory'),
+    cpu: parsePressureFile('cpu'),
+    io: parsePressureFile('io')
+  };
+}
+
 // 采集系统信息（CPU 需 ~1s 双采样）
 async function collectSystem() {
   const mem = readMeminfo();
@@ -474,6 +510,7 @@ async function collectSystem() {
     network: getNetInfo(),
     disk_io: getDiskIoInfo(),
     processes: getProcesses(),
+    psi: readPressure(),
     uptime: os.uptime(),
     os: `${os.type()} ${os.release()} (${os.arch()})`,
     hostname: os.hostname()
@@ -577,6 +614,13 @@ function swapPercent() {
   }
 }
 
+// PSI 历史取值：memory/cpu/io 的 some avg10（percent，native 已是滑动均值）
+function psiHistPoint() {
+  const p = readPressure();
+  const avg = (o) => (o && o.some && Number.isFinite(o.some.avg10) ? o.some.avg10 : null);
+  return { psi_mem_avg10: avg(p.memory), psi_cpu_avg10: avg(p.cpu), psi_io_avg10: avg(p.io) };
+}
+
 // 每次采样：CPU/内存为百分比，网速与磁盘 I/O 为两次采样差值换算的速率（字节/秒）。
 // 直接读原始计数（cpuSample/netSample/diskioSample），不扰动 /api/admin/system 的独立采样状态
 function sampleHistory() {
@@ -608,11 +652,16 @@ function sampleHistory() {
   histNetPrev = { ts: now, rx: net.rx, tx: net.tx };
   histDiskioPrev = { ts: now, read: io.read, write: io.write };
 
+  const psi = psiHistPoint();
+
   historyBuffer.push({
     ts: now,
     cpu: cpuPercent,
     mem_percent: memPercent(),
     swap_percent: swapPercent(),
+    psi_mem_avg10: psi.psi_mem_avg10,
+    psi_cpu_avg10: psi.psi_cpu_avg10,
+    psi_io_avg10: psi.psi_io_avg10,
     net_rx_rate: Math.round(netRxRate),
     net_tx_rate: Math.round(netTxRate),
     disk_io_read: Math.round(ioReadRate),
