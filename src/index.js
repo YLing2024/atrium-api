@@ -1266,6 +1266,26 @@ app.get('/api/admin/term/sessions', authRequired, (req, res) => {
   }
 });
 
+// 批量关闭终端会话（需鉴权）：浏览器关窗/关标签时前端用 sendBeacon 调用，
+// 避免会话与连接残留在服务端。names 不在白名单内的一律忽略（不做注入面）。
+app.post('/api/admin/term/sessions/close', authRequired, (req, res) => {
+  const body = req.body || {};
+  const names = Array.isArray(body.names) ? body.names : [];
+  const killed = [];
+  for (const raw of names.slice(0, 32)) {
+    const name = String(raw || '');
+    if (!TERM_SESSION_RE.test(name)) continue;
+    try {
+      execSync(`tmux kill-session -t '${name}' 2>/dev/null || true`, { encoding: 'utf-8' });
+      killed.push(name);
+    } catch (e) {
+      /* 单个失败不影响整体 */
+    }
+  }
+  if (killed.length) auditLog('term_sessions_close', clientIp(req), true, killed.join(','));
+  res.json({ ok: true, killed });
+});
+
 // 关闭指定终端会话（需鉴权）：admin 里关掉标签页时调用
 app.delete('/api/admin/term/sessions/:name', authRequired, (req, res) => {
   const name = String(req.params.name || '');
