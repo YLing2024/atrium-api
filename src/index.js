@@ -1236,6 +1236,49 @@ app.get('/api/admin/versions', authRequired, async (req, res) => {
   }
 });
 
+/* ---------- Web 终端会话（ttyd + tmux） ---------- */
+// 会话名白名单：term- 前缀 + 小写字母/数字/短横，长度受限 —— 杜绝 tmux 命令注入
+const TERM_SESSION_RE = /^term-[a-z0-9][a-z0-9-]{0,31}$/;
+
+// 列出 ttyd/tmux 的终端会话（只暴露本系统创建的 term-* 会话）
+function listTermSessions() {
+  const out = execSync(
+    "tmux list-sessions -F '#{session_name}|#{session_attached}|#{session_activity}' 2>/dev/null || true",
+    { encoding: 'utf-8' }
+  );
+  return out
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => {
+      const [name, attached, activity] = line.split('|');
+      return { name, attached: attached === '1', activity: Number(activity) || 0 };
+    })
+    .filter((s) => TERM_SESSION_RE.test(s.name));
+}
+
+// 终端会话列表（需鉴权）
+app.get('/api/admin/term/sessions', authRequired, (req, res) => {
+  try {
+    res.json({ sessions: listTermSessions() });
+  } catch (e) {
+    res.status(500).json({ error: '读取终端会话失败: ' + e.message });
+  }
+});
+
+// 关闭指定终端会话（需鉴权）：admin 里关掉标签页时调用
+app.delete('/api/admin/term/sessions/:name', authRequired, (req, res) => {
+  const name = String(req.params.name || '');
+  if (!TERM_SESSION_RE.test(name)) return res.status(400).json({ error: '非法会话名' });
+  try {
+    execSync(`tmux kill-session -t '${name}' 2>/dev/null || true`, { encoding: 'utf-8' });
+    auditLog('term_session_kill', clientIp(req), true, name);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: '关闭终端会话失败: ' + e.message });
+  }
+});
+
 // 服务状态（需鉴权）。返回各服务 [{ name, status: up/down, pid? }]、
 // 进程排行 TOP15 与全部进程瞬时 CPU 合计 total_cpu（与系统卡片同口径）。
 // collectProcesses 内部做单次 /proc 全量遍历，进程 cpu 与 total_cpu 同源同基准
