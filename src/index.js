@@ -97,6 +97,12 @@ function auditLog(action, ip, ok, detail) {
 
 // 取客户端 IP：优先 req.ip（Express 已处理 X-Forwarded-For），退化为 socket 地址
 function clientIp(req) {
+  // nginx 统一注入 X-Real-IP（admin-server 只监听 127.0.0.1，客户端无法伪造）；
+  // 不读它的话 req.ip 恒为 127.0.0.1 —— 限流会退化成全局限流、审计日志也丢来源 IP
+  const xr = req.headers['x-real-ip'];
+  if (xr && String(xr).trim()) return String(xr).trim();
+  const xf = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+  if (xf) return xf;
   return req.ip || (req.socket && req.socket.remoteAddress) || 'unknown';
 }
 
@@ -1256,6 +1262,76 @@ function listTermSessions() {
     })
     .filter((s) => TERM_SESSION_RE.test(s.name));
 }
+
+/* ---------- 终端二次验证（口令 → 短期票） ---------- */
+// 口令只存哈希：/root/.hermes/term_password 内容 "sha256$<salt>$<hash>"（600，不入库）
+const TERM_PW_FILE = process.env.ADMIN_TERM_PW_FILE || path.join(os.homedir(), '.hermes', 'term_password');
+const TERM_TICKET_PREFIX = 'term:ticket:';
+const TERM_TICKET_TTL = 12 * 3600; // 12 小时
+const TERM_UNLOCK_MAX_FAILS = 5;
+const TERM_UNLOCK_LOCKOUT_MS = 10 * 60 * 1000; // 连续失败 5 次锁 10 分钟
+const termUnlockState = new Map(); // ip -> { fails, until }
+
+function termPasswordOk(pw) {
+  try {
+    const raw = fs.readFileSync(TERM_PW_FILE, 'utf-8').trim();
+    const [algo, salt, hash] = raw.split('$');
+    if (algo !== 'sha256' || !salt || !hash) return false;
+    const got = crypto.createHash('sha256').update(salt + ':' + String(pw)).digest('hex');
+    const a = Buffer.from(got, 'hex');
+    const b = Buffer.from(hash, 'hex');
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+  } catch (e) {
+    return false; // 文件缺失/损坏一律拒绝
+  }
+}
+
+// 终端口令校验 → 下发短期票（前端拿票去开终端会话）
+app.post('/api/admin/term/unlock', authRequired, async (req, res) => {
+  const ip = clientIp(req);
+  const st = termUnlockState.get(ip) || { fails: 0, until: 0 };
+  const now = Date.now();
+  if (st.until > now) {
+    return res.status(429).json({ error: '尝试过多，请稍后再试', retryAfter: Math.ceil((st.until - now) / 1000) });
+  }
+  const pw = String((req.body && req.body.password) || '');
+  if (!termPasswordOk(pw)) {
+    st.fails += 1;
+    if (st.fails >= TERM_UNLOCK_MAX_FAILS) {
+      st.until = now + TERM_UNLOCK_LOCKOUT_MS;
+      st.fails = 0;
+    }
+    termUnlockState.set(ip, st);
+    auditLog('term_unlock_fail', ip, false, `fails=${st.fails}`);
+    return res.status(401).json({ error: '口令不正确' });
+  }
+  termUnlockState.set(ip, { fails: 0, until: 0 });
+  const ticket = crypto.randomBytes(32).toString('hex');
+  try {
+    await redis.set(TERM_TICKET_PREFIX + sha256hex(ticket), '1', 'EX', TERM_TICKET_TTL);
+  } catch (e) {
+    return res.status(500).json({ error: '票据存储失败: ' + e.message });
+  }
+  auditLog('term_unlock_ok', ip, true, '');
+  res.json({ ticket, expiresIn: TERM_TICKET_TTL });
+});
+
+// 票据校验（供服务端 wrapper 起 shell 前调用；只允许本机）
+app.get('/api/admin/term/verify', async (req, res) => {
+  const ip = clientIp(req);
+  if (!(ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1')) {
+    return res.status(403).json({ ok: false });
+  }
+  const ticket = String((req.query && req.query.ticket) || '');
+  if (!ticket) return res.status(400).json({ ok: false });
+  try {
+    const v = await redis.get(TERM_TICKET_PREFIX + sha256hex(ticket));
+    if (!v) return res.status(401).json({ ok: false });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ ok: false });
+  }
+});
 
 // 终端会话列表（需鉴权）
 app.get('/api/admin/term/sessions', authRequired, (req, res) => {
