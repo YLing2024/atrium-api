@@ -1183,9 +1183,8 @@ const VERSION_CHECKS = [
   { name: 'npm', category: 'runtime', cmd: `PATH=${NODE_BIN}:$PATH ${NODE_BIN}/npm --version` },
   { name: 'Python', category: 'runtime', cmd: "python3 --version 2>&1 | awk '{print $2}'" },
   { name: 'Hermes', category: 'service', cmd: "/usr/local/bin/hermes version 2>/dev/null | head -1 | grep -oE 'v[0-9.]+' | head -1 | sed 's/^v//'" },
-  // opencode 当前版本直接读 package.json（opencode --version 需 4.5s，cat 毫秒级）
-  // 2.0 起包名由 opencode-ai 改为 @opencode/cli（全局安装路径随包名变）
-  { name: 'OpenCode', category: 'service', cmd: "cat /root/.nvm/versions/node/v24.19.0/lib/node_modules/@opencode/cli/package.json | grep -m1 '\"version\"' | grep -oE '[0-9]+\\.[0-9]+\\.[0-9]+'" },
+  // pi coding agent 版本（2026-09-12 接替 opencode 成为编码 subagent；opencode 已退役）
+  { name: 'pi', category: 'service', cmd: "cat /root/.nvm/versions/node/v24.19.0/lib/node_modules/@earendil-works/pi-coding-agent/package.json | grep -m1 '\"version\"' | grep -oE '[0-9]+\\.[0-9]+\\.[0-9]+'" },
   // codex CLI 版本直接读 package.json（codex --version 输出 'codex-cli x.y.z' 格式，cat 更稳）
   { name: 'Codex', category: 'service', cmd: "cat /root/.nvm/versions/node/v24.19.0/lib/node_modules/@openai/codex/package.json | grep -m1 '\"version\"' | grep -oE '[0-9]+\\.[0-9]+\\.[0-9]+'" },
   // playwright cli 为 #!/usr/bin/env node，需带 PATH 前缀才能在 systemd 精简环境跑通；
