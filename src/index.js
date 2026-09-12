@@ -1407,6 +1407,14 @@ async function collectProcesses() {
           name = 'opencode';
         } else if (comm === 'agent-browser' || args.includes('agent-browser')) {
           name = 'agent-browser';
+        } else if (
+          comm === 'pi' ||
+          args.includes('pi-coding-agent') ||
+          /(^|\/)pi(\.js)?$/.test(args.trim())
+        ) {
+          // pi coding agent（@earendil-works/pi-coding-agent）：启动后会把进程标题改写成纯 "pi"，
+          // 故优先按 comm 判定；另保留包名/裸命令两种兜底形态
+          name = 'pi';
         } else if (comm === 'node' || args.includes('node')) {
           name = 'node';
         } else if (/^python/.test(comm)) {
