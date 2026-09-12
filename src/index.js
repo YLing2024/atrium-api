@@ -354,7 +354,9 @@ function getDiskIoInfo() {
 
 // 解析 /proc/meminfo（单位 kB → bytes）。任一字段缺失回退 os.*，整体失败回退全部 os.*。
 // 现文件若干函数直接读 /proc，此处同样直接读文件（fs.existsSync + try/catch 容错，代价可忽略）。
-// 返回 { total, used, free, available, buffCache, swapTotal, swapUsed, swapFree }
+// 返回 { total, used, free, available, buffCache, swapTotal, swapUsed, swapFree, swapPercent }
+// 其中 used = 真实占用（= total − available），不含内核可回收的页缓存/缓冲；
+// 过去用的 total − free 会把页缓存算成已用，导致面板虚高（本机实测 90% vs 真实 71%）。
 function readMeminfo() {
   let info = {};
   try {
@@ -377,7 +379,9 @@ function readMeminfo() {
     info.Buffers != null && info.Cached != null ? info.Buffers + info.Cached : null;
   const swapTotal = info.SwapTotal != null ? info.SwapTotal : 0;
   const swapFree = info.SwapFree != null ? info.SwapFree : 0;
-  const used = total - free;
+  // used 优先取 total − MemAvailable：MemAvailable 已扣除可回收的页缓存/缓冲，
+  // 是内核给出的"还能给新进程用多少"的估算；缺失时回退旧口径 total − free。
+  const used = available != null ? total - available : total - free;
   const swapUsed = swapTotal - swapFree;
   return {
     total,
@@ -488,8 +492,8 @@ function readPressure() {
 // 采集系统信息（CPU 需 ~1s 双采样）
 async function collectSystem() {
   const mem = readMeminfo();
-  // 内存 percent：保留现有 used=total-free 语义（used/free 不变，历史曲线语义不动），
-  // 新增 available/buffCache/swap/zram 供前端明细展示
+  // 内存 percent = 真实占用 (total − available) / total，口径与 free -h 的 available 一致，
+  // 不再把可回收的页缓存算成已用；历史曲线会因此整体下移（预期变化）。
   const percent = mem.total > 0 ? Math.round((mem.used / mem.total) * 1000) / 10 : 0;
   return {
     cpu: getCpuInfo(),
@@ -588,8 +592,22 @@ let histDiskioPrev = null;
 
 const CPU_EMA_ALPHA = 0.4; // 统一 EMA 平滑系数：系统卡片 / 进程排行 / 历史趋势全走同一函数同一参数
 
-// 内存使用率（百分比，一位小数）
+// 内存使用率（百分比，一位小数）—— 真实占用口径：total − MemAvailable
+// 与 collectSystem()/free -h 的 available 一致（不含可回收的页缓存）
 function memPercent() {
+  try {
+    const text = fs.readFileSync('/proc/meminfo', 'utf-8');
+    const kv = {};
+    for (const line of text.split('\n')) {
+      const m = line.match(/^(\w+):\s+(\d+)\s*kB/);
+      if (m) kv[m[1]] = parseInt(m[2], 10) * 1024;
+    }
+    if (kv.MemTotal > 0 && kv.MemAvailable != null) {
+      return Math.round(((kv.MemTotal - kv.MemAvailable) / kv.MemTotal) * 1000) / 10;
+    }
+  } catch (e) {
+    // /proc/meminfo 不可读时走下面回退
+  }
   const total = os.totalmem();
   if (total <= 0) return 0;
   return Math.round(((total - os.freemem()) / total) * 1000) / 10;
@@ -698,7 +716,6 @@ const SERVICE_CHECKS = [
   { name: 'nginx', port: 80 },
   { name: 'redis', port: 6379 },
   { name: 'cloudreve', port: 5212 },
-  { name: 'alist', port: 5244 },
   { name: 'blog', port: 4000 },
   { name: 'admin-test', port: 3101 }
 ];
@@ -1167,17 +1184,19 @@ const VERSION_CHECKS = [
   { name: 'Python', category: 'runtime', cmd: "python3 --version 2>&1 | awk '{print $2}'" },
   { name: 'Hermes', category: 'service', cmd: "/usr/local/bin/hermes version 2>/dev/null | head -1 | grep -oE 'v[0-9.]+' | head -1 | sed 's/^v//'" },
   // opencode 当前版本直接读 package.json（opencode --version 需 4.5s，cat 毫秒级）
-  { name: 'OpenCode', category: 'service', cmd: "cat /root/.nvm/versions/node/v24.19.0/lib/node_modules/opencode-ai/package.json | grep -m1 '\"version\"' | grep -oE '[0-9]+\\.[0-9]+\\.[0-9]+'" },
+  // 2.0 起包名由 opencode-ai 改为 @opencode/cli（全局安装路径随包名变）
+  { name: 'OpenCode', category: 'service', cmd: "cat /root/.nvm/versions/node/v24.19.0/lib/node_modules/@opencode/cli/package.json | grep -m1 '\"version\"' | grep -oE '[0-9]+\\.[0-9]+\\.[0-9]+'" },
+  // codex CLI 版本直接读 package.json（codex --version 输出 'codex-cli x.y.z' 格式，cat 更稳）
+  { name: 'Codex', category: 'service', cmd: "cat /root/.nvm/versions/node/v24.19.0/lib/node_modules/@openai/codex/package.json | grep -m1 '\"version\"' | grep -oE '[0-9]+\\.[0-9]+\\.[0-9]+'" },
   // playwright cli 为 #!/usr/bin/env node，需带 PATH 前缀才能在 systemd 精简环境跑通；
   // --version 输出形如 'Version 1.62.1'，提取裸版本号与其他条目格式一致
   { name: 'Playwright', category: 'service', cmd: "PATH=/root/.nvm/versions/node/v24.19.0/bin:$PATH /root/.nvm/versions/node/v24.19.0/bin/playwright --version | grep -oE '[0-9]+\\.[0-9]+\\.[0-9]+' | head -1" },
   { name: 'dida-cli', category: 'service', cmd: "cat /root/.nvm/versions/node/v24.19.0/lib/node_modules/@suibiji/dida-cli/package.json | grep -m1 \"version\" | grep -oE '[0-9]+\\.[0-9]+\\.[0-9]+'" },
   { name: 'Cloudreve', category: 'service', cmd: "curl -s --max-time 3 http://127.0.0.1:5212/api/v4/site/ping | python3 -c \"import json,sys; print('v'+json.load(sys.stdin)['data'])\"" },
-  { name: 'Alist', category: 'service', cmd: "/root/proj/alist/alist version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1 | sed 's/^v//'" },
   { name: 'DeepTutor', category: 'service', cmd: '/root/proj/deeptutor/.venv/bin/pip show deeptutor | grep -m1 Version | awk \'{print $2}\'' },
 ];
 
-// 版本结果缓存：1 秒轮询若每次都执行 VERSION_CHECKS 会堆积重命令进程（如 alist version ~70MB/次），
+// 版本结果缓存：1 秒轮询若每次都执行 VERSION_CHECKS 会堆积重命令进程，
 // 故缓存 60 秒，命中窗口内直接返回上次结果，不再重复执行命令
 const VERSION_CACHE_TTL_MS = 60000;
 const versionCache = { ts: 0, list: null };
@@ -1238,7 +1257,6 @@ const SYSTEMD_SERVICES = [
   'auth-server',
   'deeptutor',
   'cloudreve',
-  'alist',
   'nginx',
   'redis-server',
   'hermes-gateway',
