@@ -1668,6 +1668,12 @@ const fileStorage = multer.diskStorage({
   destination: (req, file, cb) => {
     const dir = resolveFileRel(req.query && req.query.path);
     if (!dir) return cb(new Error('目标路径非法'));
+    // 目标目录不存在时按需创建（拖拽文件夹上传时会带上相对路径）
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+    } catch (e) {
+      return cb(new Error('创建目标目录失败：' + e.message));
+    }
     cb(null, dir);
   },
   filename: (req, file, cb) => {
