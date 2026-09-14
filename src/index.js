@@ -24,6 +24,14 @@ const config = require('./config');
 const PORT = parseInt(process.env.PORT, 10) || 3100;
 const HOST = process.env.HOST || '0.0.0.0';
 const UPLOAD_DIR = process.env.ADMIN_UPLOAD_DIR || path.join(__dirname, '..', 'uploads'); // 上传文件目录
+// 文件区：admin「文件」Tab 的上传落点。独立于 uploads/，专用于把文件传给 Hermes（保留原始文件名）
+const FILE_DIR = process.env.ADMIN_FILE_DIR || '/root/files/download';
+const FILE_MAX_BYTES = 500 * 1024 * 1024; // 单文件上限 500MB（与 /api/admin/upload 的 100MB 相互独立）
+try {
+  fs.mkdirSync(FILE_DIR, { recursive: true });
+} catch (e) {
+  console.error('[admin-server] 文件区目录创建失败:', e.message);
+}
 // Hermes 会话数据库（只读浏览历史记录用）；默认取本机 Hermes state.db，可被环境变量覆盖（测试实例隔离）
 const HERMES_STATE_DB =
   process.env.HERMES_STATE_DB || path.join(os.homedir(), '.hermes', 'state.db');
@@ -1596,6 +1604,215 @@ app.post('/api/admin/upload', authRequired, upload.single('file'), (req, res) =>
   }
   auditLog('upload', clientIp(req), true, req.file.path); // 记录落盘路径
   res.json({ path: req.file.path }); // 返回绝对路径，供 image.attach / file.attach 使用
+});
+
+/* ============ 文件区（admin「文件」Tab：目录浏览 / 上传 / 下载 / 新建 / 重命名 / 删除） ============ */
+// 根目录 = FILE_DIR，所有路径严格限制在其内部；跳过符号链接，防逃逸。
+
+// 还原原始文件名：busboy 按 latin1 解码 Content-Disposition，中文名会变乱码；按 latin1→utf8 还原
+function decodeOriginalName(raw) {
+  const name = String(raw || '');
+  try {
+    const utf8 = Buffer.from(name, 'latin1').toString('utf8');
+    if (!utf8.includes('\uFFFD')) return utf8;
+  } catch (e) {
+    // 落到下面的原值
+  }
+  return name;
+}
+
+// 单个文件/目录名：去分隔符与控制字符，拒绝 . / .. / 空
+function sanitizeSegment(raw) {
+  const base = path
+    .basename(decodeOriginalName(raw))
+    .replace(/[\u0000-\u001f\u007f]/g, '')
+    .replace(/[\\/]/g, '')
+    .trim();
+  if (!base || base === '.' || base === '..') return '';
+  return base;
+}
+
+// 重名不覆盖：notes.7z → notes-2.7z → notes-3.7z
+function uniqueFileName(dir, raw) {
+  const name = sanitizeSegment(raw) || 'unnamed';
+  if (!fs.existsSync(path.join(dir, name))) return name;
+  const ext = path.extname(name);
+  const stem = name.slice(0, name.length - ext.length) || 'file';
+  for (let i = 2; i < 10000; i += 1) {
+    const candidate = `${stem}-${i}${ext}`;
+    if (!fs.existsSync(path.join(dir, candidate))) return candidate;
+  }
+  return `${stem}-${Date.now()}${ext}`;
+}
+
+// 外部传入的相对路径 → FILE_DIR 内的绝对路径；越界/非法返回 null
+function resolveFileRel(rel) {
+  let decoded;
+  try {
+    decoded = decodeURIComponent(String(rel == null ? '' : rel));
+  } catch (e) {
+    return null;
+  }
+  const full = path.resolve(FILE_DIR, decoded.replace(/^\/+/, ''));
+  if (full !== FILE_DIR && !full.startsWith(FILE_DIR + path.sep)) return null;
+  return full;
+}
+
+// 绝对路径 → 相对 FILE_DIR 的路径（用 / 分隔）；根目录为 ''
+function relFromFull(full) {
+  const rel = path.relative(FILE_DIR, full);
+  return rel === '' ? '' : rel.split(path.sep).join('/');
+}
+
+const fileStorage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    const dir = resolveFileRel(req.query && req.query.path);
+    if (!dir) return cb(new Error('目标路径非法'));
+    cb(null, dir);
+  },
+  filename: (req, file, cb) => {
+    const dir = resolveFileRel(req.query && req.query.path);
+    cb(null, uniqueFileName(dir || FILE_DIR, file.originalname));
+  }
+});
+const fileUpload = multer({ storage: fileStorage, limits: { fileSize: FILE_MAX_BYTES } });
+
+// 上传：错误在本层处理，避免落到底部通用 multer 处理器（那里写死了 100MB 文案）
+app.post('/api/admin/files/upload', authRequired, (req, res) => {
+  fileUpload.single('file')(req, res, (err) => {
+    if (err) {
+      const tooLarge = err.code === 'LIMIT_FILE_SIZE';
+      const msg = tooLarge
+        ? `文件超过 ${Math.round(FILE_MAX_BYTES / 1024 / 1024)}MB 上限`
+        : `上传失败：${err.message}`;
+      auditLog('upload', clientIp(req), false, msg);
+      return res.status(tooLarge ? 413 : 400).json({ error: msg });
+    }
+    if (!req.file) {
+      auditLog('upload', clientIp(req), false, '未收到文件');
+      return res.status(400).json({ error: '未收到文件（字段名应为 file）' });
+    }
+    auditLog('upload', clientIp(req), true, `${req.file.filename} (${req.file.size}B)`);
+    res.json({ name: req.file.filename, size: req.file.size, path: req.file.path });
+  });
+});
+
+// 列目录：目录在前，同类按名称排序（中文用拼音序）
+app.get('/api/admin/files', authRequired, (req, res) => {
+  const dir = resolveFileRel(req.query.path);
+  if (!dir) return res.status(400).json({ error: '路径非法' });
+  let st;
+  try {
+    st = fs.lstatSync(dir);
+  } catch (e) {
+    return res.status(404).json({ error: '目录不存在' });
+  }
+  if (!st.isDirectory()) return res.status(400).json({ error: '不是目录' });
+  try {
+    const entries = fs
+      .readdirSync(dir, { withFileTypes: true })
+      .map((d) => {
+        let s;
+        try {
+          s = fs.lstatSync(path.join(dir, d.name));
+        } catch (e) {
+          return null;
+        }
+        const isDir = s.isDirectory();
+        // 跳过符号链接与特殊文件（防逃逸）
+        if (!isDir && !s.isFile()) return null;
+        return {
+          name: d.name,
+          type: isDir ? 'dir' : 'file',
+          size: isDir ? 0 : s.size,
+          mtime: s.mtimeMs
+        };
+      })
+      .filter(Boolean)
+      .sort((a, b) => {
+        if (a.type !== b.type) return a.type === 'dir' ? -1 : 1;
+        return a.name.localeCompare(b.name, 'zh-Hans-CN');
+      });
+    const rel = relFromFull(dir);
+    const parent = rel === '' ? null : rel.includes('/') ? rel.slice(0, rel.lastIndexOf('/')) : '';
+    res.json({ path: rel, parent, entries });
+  } catch (e) {
+    res.status(500).json({ error: '读取目录失败：' + e.message });
+  }
+});
+
+// 下载单个文件
+app.get('/api/admin/files/download', authRequired, (req, res) => {
+  const full = resolveFileRel(req.query.path);
+  if (!full) return res.status(400).json({ error: '路径非法' });
+  let st;
+  try {
+    st = fs.lstatSync(full);
+  } catch (e) {
+    return res.status(404).json({ error: '文件不存在' });
+  }
+  if (!st.isFile()) return res.status(400).json({ error: '不是普通文件' });
+  res.download(full, path.basename(full));
+});
+
+// 新建文件夹
+app.post('/api/admin/files/mkdir', authRequired, (req, res) => {
+  const dir = resolveFileRel(req.body && req.body.path);
+  if (!dir) return res.status(400).json({ error: '路径非法' });
+  const name = sanitizeSegment(req.body && req.body.name);
+  if (!name) return res.status(400).json({ error: '名称非法' });
+  const target = path.join(dir, name);
+  if (!target.startsWith(FILE_DIR + path.sep)) return res.status(400).json({ error: '路径非法' });
+  if (fs.existsSync(target)) return res.status(409).json({ error: '同名已存在' });
+  try {
+    fs.mkdirSync(target);
+  } catch (e) {
+    auditLog('mkdir', clientIp(req), false, `${name}: ${e.message}`);
+    return res.status(500).json({ error: '创建失败：' + e.message });
+  }
+  auditLog('mkdir', clientIp(req), true, relFromFull(target));
+  res.json({ ok: true, path: relFromFull(target) });
+});
+
+// 重命名（文件或目录）
+app.post('/api/admin/files/rename', authRequired, (req, res) => {
+  const full = resolveFileRel(req.body && req.body.path);
+  if (!full || full === FILE_DIR) return res.status(400).json({ error: '路径非法' });
+  const name = sanitizeSegment(req.body && req.body.name);
+  if (!name) return res.status(400).json({ error: '名称非法' });
+  const target = path.join(path.dirname(full), name);
+  if (!target.startsWith(FILE_DIR + path.sep)) return res.status(400).json({ error: '路径非法' });
+  if (!fs.existsSync(full)) return res.status(404).json({ error: '文件不存在' });
+  if (target !== full && fs.existsSync(target)) return res.status(409).json({ error: '同名已存在' });
+  try {
+    fs.renameSync(full, target);
+  } catch (e) {
+    auditLog('rename', clientIp(req), false, `${relFromFull(full)}: ${e.message}`);
+    return res.status(500).json({ error: '重命名失败：' + e.message });
+  }
+  auditLog('rename', clientIp(req), true, `${relFromFull(full)} → ${relFromFull(target)}`);
+  res.json({ ok: true, path: relFromFull(target) });
+});
+
+// 删除（目录递归）
+app.delete('/api/admin/files', authRequired, (req, res) => {
+  const full = resolveFileRel(req.query.path);
+  if (!full || full === FILE_DIR) return res.status(400).json({ error: '路径非法' });
+  let st;
+  try {
+    st = fs.lstatSync(full);
+  } catch (e) {
+    return res.status(404).json({ error: '文件不存在' });
+  }
+  const rel = relFromFull(full);
+  try {
+    fs.rmSync(full, { recursive: st.isDirectory(), force: false });
+  } catch (e) {
+    auditLog('delete', clientIp(req), false, `${rel}: ${e.message}`);
+    return res.status(500).json({ error: '删除失败：' + e.message });
+  }
+  auditLog('delete', clientIp(req), true, rel);
+  res.json({ ok: true });
 });
 
 // 下载白名单根目录：AI 回复的文件可能落在 uploads、/root、/tmp、/home、/var/www 等位置
