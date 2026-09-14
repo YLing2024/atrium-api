@@ -9,6 +9,7 @@
 - 系统监控：CPU / 内存 / 磁盘 / 网络实时与历史采样（内存采样器 + SSE 推送）
 - 软件版本、systemd 服务状态
 - 文件上传 / 下载（限 `uploads/` 内）
+- **文件区**（admin「文件」Tab 的后端）：目录浏览 / 上传 / 下载 / 新建文件夹 / 重命名 / 删除，根目录由 `ADMIN_FILE_DIR` 指定
 - 修改管理密码、TOTP 重置转发
 - 登录设备会话管理（转发到认证中心）
 - 接口令牌（API Token）管理
@@ -56,8 +57,14 @@ npm start        # = node src/index.js，监听 3100
 | GET | `/api/admin/system/stream` | ✅ | SSE 实时推送 |
 | GET | `/api/admin/versions` | ✅ | 软件版本 |
 | GET | `/api/admin/services` | ✅ | systemd 服务状态 |
-| POST | `/api/admin/upload` | ✅ | multipart，字段名 `file` |
+| POST | `/api/admin/upload` | ✅ | multipart，字段名 `file`（上限 100MB） |
 | GET | `/api/admin/download?path=` | ✅ | 仅限 `uploads/` 内 |
+| GET | `/api/admin/files?path=` | ✅ | 文件区列目录（`{ path, parent, entries[] }`，目录在前） |
+| POST | `/api/admin/files/upload?path=` | ✅ | 文件区上传（上限 500MB，保留原始文件名，重名加 `-2`） |
+| GET | `/api/admin/files/download?path=` | ✅ | 文件区下载 |
+| POST | `/api/admin/files/mkdir` | ✅ | 新建文件夹（body `{ path, name }`） |
+| POST | `/api/admin/files/rename` | ✅ | 重命名（body `{ path, name }`） |
+| DELETE | `/api/admin/files?path=` | ✅ | 删除文件或目录（目录递归） |
 | POST | `/api/admin/password` | ✅ | 修改密码（≥8 位），同步写回 config.json |
 | GET | `/api/admin/history[/:id]` | ✅ | Hermes 会话只读浏览 |
 | `*` | `/api/admin/sessions*` | ✅ | 转发认证中心 `/api/sessions` |
@@ -79,6 +86,7 @@ npm start        # = node src/index.js，监听 3100
 | `PORT` / `HOST` | `3100` / `127.0.0.1` | systemd 里设置了 `HOST=127.0.0.1` |
 | `ADMIN_CONFIG_PATH` | `../config.json` | 配置文件路径 |
 | `ADMIN_UPLOAD_DIR` | `../uploads` | 上传目录 |
+| `ADMIN_FILE_DIR` | `/root/files/download` | 文件区根目录（admin「文件」Tab；所有路径严格限制在其内） |
 | `ADMIN_AUDIT_LOG` | `../audit.log` | 审计日志 |
 | `HERMES_STATE_DB` | `~/.hermes/state.db` | 历史浏览数据源（测试用可覆盖隔离） |
 | `AUTH_CENTER_BASE_URL` / `AUTH_CENTER_VERIFY_URL` | 认证中心 | 转发与探针地址 |
@@ -96,6 +104,10 @@ npm start        # = node src/index.js，监听 3100
 ## 已知坑
 
 - **单文件大块头**：所有路由都在 `src/index.js`。改动时按注释分区定位，别整体重排（会产生巨大 diff）。
+- 🔴 **nginx 侧有两条与大文件上传相关的硬约束**（2026-09-14 踩坑，改配置前必读）：
+  1. `/api/admin/` 的 `client_max_body_size` 是 **100m**，文件区上传走的是单独加的 `location /api/admin/files/upload`（**512m**）。新增任何接收大 body 的接口，都要确认它落在哪个 location、那个 location 的上限是多少——**nginx 先于应用层拒绝，返回的是 HTML 而不是 JSON**。
+  2. **`/auth-check` 探针 location 必须显式写 `client_max_body_size 0;`**。SSO 探针是个子请求，它**不会**继承父 location 的上限，而是用全局默认 **1m**——不写这行，任何 >1MB 的上传都会在鉴权阶段被 413 掉（表现为 500 + `auth request unexpected status: 413`）。
+  3. 别在该 location 上加 `proxy_request_buffering off;`：`auth_request` 要求请求体先缓冲，关掉后**连 5MB 都传不上去**（会 500）。
 - 历史浏览用 **`node:sqlite` 只读打开**，不要改成可写或长连接持有（Hermes 网关正在写同一个库）。
 - 采样器有 Redis/文件锁（`ADMIN_SAMPLER_LOCK`）防多实例重复采样；测试实例务必改锁与前缀，否则会和线上互相干扰。
 - 无热重载：改完必须重启进程才生效。
