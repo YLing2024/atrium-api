@@ -27,6 +27,9 @@ const UPLOAD_DIR = process.env.ADMIN_UPLOAD_DIR || path.join(__dirname, '..', 'u
 // 文件区：admin「文件」Tab 的上传落点。独立于 uploads/，专用于把文件传给 Hermes（保留原始文件名）
 const FILE_DIR = process.env.ADMIN_FILE_DIR || '/root/files/download';
 const FILE_MAX_BYTES = 500 * 1024 * 1024; // 单文件上限 500MB（与 /api/admin/upload 的 100MB 相互独立）
+// 文件区根目录这一层的保护名单：正在使用的 swap 文件与 ext4 的 lost+found，不可见也不可被写操作命中。
+// 只保护根目录这一层，子目录中的同名文件（如 <root>/backup/swapfile）不受影响。
+const FILE_ROOT_PROTECTED = new Set(['swapfile', 'lost+found']);
 try {
   fs.mkdirSync(FILE_DIR, { recursive: true });
 } catch (e) {
@@ -1722,6 +1725,17 @@ function resolveFileRel(rel) {
   return full;
 }
 
+// 判断一个（已经过 resolveFileRel 的）绝对路径是否命中文件区根目录保护名单。
+// 规则：取相对 FILE_DIR 的第一段，命中 FILE_ROOT_PROTECTED 才算保护；根目录自身不受保护。
+// 只匹配根目录这一层——真实路径比较，不做字符串模糊匹配（my-swapfile.txt 不会被误伤）。
+function isProtectedPath(full) {
+  if (full === FILE_DIR) return false;
+  const rel = path.relative(FILE_DIR, full);
+  if (!rel || rel === '..' || rel.startsWith('..' + path.sep) || path.isAbsolute(rel)) return false;
+  const top = rel.split(path.sep)[0];
+  return FILE_ROOT_PROTECTED.has(top);
+}
+
 // 绝对路径 → 相对 FILE_DIR 的路径（用 / 分隔）；根目录为 ''
 function relFromFull(full) {
   const rel = path.relative(FILE_DIR, full);
@@ -1762,6 +1776,16 @@ app.post('/api/admin/files/upload', authRequired, (req, res) => {
       auditLog('upload', clientIp(req), false, '未收到文件');
       return res.status(400).json({ error: '未收到文件（字段名应为 file）' });
     }
+    // 文件区根目录保护名单：multer 已落盘，按最终路径判定；命中则删除已写入文件并拒绝
+    if (isProtectedPath(path.resolve(req.file.path))) {
+      try {
+        fs.rmSync(req.file.path, { force: true });
+      } catch (e) {
+        // 清理失败不影响返回
+      }
+      auditLog('upload', clientIp(req), false, `${req.file.filename}: 受保护路径`);
+      return res.status(403).json({ error: '该文件受保护，不允许操作' });
+    }
     auditLog('upload', clientIp(req), true, `${req.file.filename} (${req.file.size}B)`);
     res.json({ name: req.file.filename, size: req.file.size, path: req.file.path });
   });
@@ -1791,6 +1815,8 @@ app.get('/api/admin/files', authRequired, (req, res) => {
         const isDir = s.isDirectory();
         // 跳过符号链接与特殊文件（防逃逸）
         if (!isDir && !s.isFile()) return null;
+        // 根目录保护名单（swapfile / lost+found）不展示
+        if (isProtectedPath(path.join(dir, d.name))) return null;
         return {
           name: d.name,
           type: isDir ? 'dir' : 'file',
@@ -1815,6 +1841,7 @@ app.get('/api/admin/files', authRequired, (req, res) => {
 app.get('/api/admin/files/download', authRequired, (req, res) => {
   const full = resolveFileRel(req.query.path);
   if (!full) return res.status(400).json({ error: '路径非法' });
+  if (isProtectedPath(full)) return res.status(403).json({ error: '该文件受保护，不允许操作' });
   let st;
   try {
     st = fs.lstatSync(full);
@@ -1833,6 +1860,7 @@ app.post('/api/admin/files/mkdir', authRequired, (req, res) => {
   if (!name) return res.status(400).json({ error: '名称非法' });
   const target = path.join(dir, name);
   if (!target.startsWith(FILE_DIR + path.sep)) return res.status(400).json({ error: '路径非法' });
+  if (isProtectedPath(target)) return res.status(403).json({ error: '该文件受保护，不允许操作' });
   if (fs.existsSync(target)) return res.status(409).json({ error: '同名已存在' });
   try {
     fs.mkdirSync(target);
@@ -1852,6 +1880,10 @@ app.post('/api/admin/files/rename', authRequired, (req, res) => {
   if (!name) return res.status(400).json({ error: '名称非法' });
   const target = path.join(path.dirname(full), name);
   if (!target.startsWith(FILE_DIR + path.sep)) return res.status(400).json({ error: '路径非法' });
+  // 源路径或目标路径命中根目录保护名单都拒绝（防止改名躲过保护 / 改名占位）
+  if (isProtectedPath(full) || isProtectedPath(target)) {
+    return res.status(403).json({ error: '该文件受保护，不允许操作' });
+  }
   if (!fs.existsSync(full)) return res.status(404).json({ error: '文件不存在' });
   if (target !== full && fs.existsSync(target)) return res.status(409).json({ error: '同名已存在' });
   try {
@@ -1868,6 +1900,7 @@ app.post('/api/admin/files/rename', authRequired, (req, res) => {
 app.delete('/api/admin/files', authRequired, (req, res) => {
   const full = resolveFileRel(req.query.path);
   if (!full || full === FILE_DIR) return res.status(400).json({ error: '路径非法' });
+  if (isProtectedPath(full)) return res.status(403).json({ error: '该文件受保护，不允许操作' });
   let st;
   try {
     st = fs.lstatSync(full);
