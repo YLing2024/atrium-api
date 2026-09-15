@@ -228,6 +228,48 @@ function cpuSample() {
   return { idle, total };
 }
 
+// 每核 CPU 展示上限：最多返回 MAX_CORES 项（超出截断；cores 字段仍报真实核数）
+const MAX_CORES = 8;
+
+// 每核采样状态：保存上一次 /proc/stat 各核累计值，用于两次采样做差（首次无样本时该核返回 0）
+let cpuPerCoreState = null;
+
+// 每核 CPU 占用：读 /proc/stat 的 cpuN 行，累加 user/nice/system/idle/iowait/irq/softirq/steal，
+// 与上次采样做差按 (Δtotal − Δidle) / Δtotal × 100 计算（内核口径，含内核与 IO 等待时间）。
+// 读取失败时返回空数组，不影响接口。
+function cpuPerCoreSample() {
+  const cores = [];
+  try {
+    const lines = fs.readFileSync('/proc/stat', 'utf-8').split('\n');
+    const cur = [];
+    for (const line of lines) {
+      if (!/^cpu\d+\s/.test(line)) continue;
+      const cols = line.trim().split(/\s+/);
+      const fields = cols.slice(1).map((v) => parseInt(v, 10) || 0);
+      if (fields.length < 8) continue;
+      cur.push({
+        id: parseInt(cols[0].slice(3), 10),
+        total: fields.slice(0, 8).reduce((a, b) => a + b, 0),
+        idle: fields[3] + fields[4] // idle + iowait
+      });
+    }
+    for (const c of cur.slice(0, MAX_CORES)) {
+      let usage = 0;
+      const prev = cpuPerCoreState && cpuPerCoreState[c.id];
+      const dt = prev ? c.total - prev.total : 0;
+      if (dt > 0) usage = ((dt - (c.idle - prev.idle)) / dt) * 100;
+      usage = Math.max(0, Math.min(100, usage));
+      cores.push({ id: c.id, usage_percent: Math.round(usage * 10) / 10 });
+    }
+    cpuPerCoreState = {};
+    for (const c of cur) cpuPerCoreState[c.id] = c;
+  } catch (e) {
+    // /proc/stat 读取失败时返回空数组
+    return [];
+  }
+  return cores;
+}
+
 // 系统卡片 CPU = 全部进程瞬时 CPU 合计（进程合计占用，不含内核/IO），与进程排行同一套算法
 function getCpuInfo() {
   const cpus = os.cpus();
@@ -236,28 +278,52 @@ function getCpuInfo() {
     model: cpus[0] ? cpus[0].model.trim() : 'unknown',
     usage_percent: totalPct,
     cores: cpus.length,
+    per_core: cpuPerCoreSample(),
     loadavg: os.loadavg()
   };
 }
 
-// 磁盘：取 df -kP 中挂载点为 '/' 的行，仅统计总量，不做目录明细扫描（单位字节）
-function getDisk() {
-  const disk = { total: 0, used: 0, free: 0, percent: 0 };
+// 磁盘（多盘）：解析 df -kP，返回所有真实挂载的设备盘（filesystem 以 /dev/ 开头，
+// 排除 tmpfs/udev/overlay 等伪文件系统），跳过 /boot、/boot/efi 系统分区；
+// 单位字节，df 失败时返回空数组。
+function getDisks() {
+  const disks = [];
   try {
     const out = execSync('df -kP', { encoding: 'utf-8' }).trim().split('\n');
     for (const line of out.slice(1)) {
       const cols = line.split(/\s+/);
-      if (cols.length < 6 || cols.slice(5).join(' ') !== '/') continue;
-      disk.total = parseInt(cols[1], 10) * 1024;
-      disk.used = parseInt(cols[2], 10) * 1024;
-      disk.free = parseInt(cols[3], 10) * 1024;
-      disk.percent = parseInt(String(cols[4]).replace('%', ''), 10) || 0;
-      break;
+      if (cols.length < 6) continue;
+      const filesystem = cols[0];
+      const mount = cols.slice(5).join(' '); // 挂载点可能含空格
+      if (!filesystem.startsWith('/dev/')) continue;
+      if (mount === '/boot' || mount === '/boot/efi') continue;
+      disks.push({
+        filesystem,
+        mount,
+        total: parseInt(cols[1], 10) * 1024,
+        used: parseInt(cols[2], 10) * 1024,
+        free: parseInt(cols[3], 10) * 1024,
+        percent: parseInt(String(cols[4]).replace('%', ''), 10) || 0
+      });
     }
   } catch (e) {
-    // df 失败时保留全 0
+    // df 失败时返回空数组
   }
 
+  return disks;
+}
+
+// 磁盘（单盘兼容）：旧字段 disk 只取挂载点为 '/' 的盘，内部复用 getDisks()，
+// 找不到时保持全 0（该字段/形状可能被前端旧代码与其它分支引用）。
+function getDisk() {
+  const disk = { total: 0, used: 0, free: 0, percent: 0 };
+  const root = getDisks().find((d) => d.mount === '/');
+  if (root) {
+    disk.total = root.total;
+    disk.used = root.used;
+    disk.free = root.free;
+    disk.percent = root.percent;
+  }
   return disk;
 }
 
@@ -525,6 +591,7 @@ async function collectSystem() {
       zram: getZram()
     },
     disk: getDisk(),
+    disks: getDisks(),
     network: getNetInfo(),
     disk_io: getDiskIoInfo(),
     processes: getProcesses(),
@@ -729,7 +796,6 @@ const SERVICE_CHECKS = [
   { name: 'hermes-serve', port: 9119 },
   { name: 'nginx', port: 80 },
   { name: 'redis', port: 6379 },
-  { name: 'cloudreve', port: 5212 },
   { name: 'blog', port: 4000 },
   { name: 'admin-test', port: 3101 }
 ];
@@ -1205,7 +1271,6 @@ const VERSION_CHECKS = [
   // --version 输出形如 'Version 1.62.1'，提取裸版本号与其他条目格式一致
   { name: 'Playwright', category: 'service', cmd: "PATH=/root/.nvm/versions/node/v24.19.0/bin:$PATH /root/.nvm/versions/node/v24.19.0/bin/playwright --version | grep -oE '[0-9]+\\.[0-9]+\\.[0-9]+' | head -1" },
   { name: 'dida-cli', category: 'service', cmd: "cat /root/.nvm/versions/node/v24.19.0/lib/node_modules/@suibiji/dida-cli/package.json | grep -m1 \"version\" | grep -oE '[0-9]+\\.[0-9]+\\.[0-9]+'" },
-  { name: 'Cloudreve', category: 'service', cmd: "curl -s --max-time 3 http://127.0.0.1:5212/api/v4/site/ping | python3 -c \"import json,sys; print('v'+json.load(sys.stdin)['data'])\"" },
   { name: 'DeepTutor', category: 'service', cmd: '/root/proj/deeptutor/.venv/bin/pip show deeptutor | grep -m1 Version | awk \'{print $2}\'' },
 ];
 
@@ -1402,7 +1467,6 @@ const SYSTEMD_SERVICES = [
   'blog-server',
   'auth-server',
   'deeptutor',
-  'cloudreve',
   'nginx',
   'redis-server',
   'hermes-gateway',
