@@ -29,7 +29,7 @@ const FILE_DIR = process.env.ADMIN_FILE_DIR || '/root/files/download';
 const FILE_MAX_BYTES = 500 * 1024 * 1024; // 单文件上限 500MB（与 /api/admin/upload 的 100MB 相互独立）
 // 文件区根目录这一层的保护名单：正在使用的 swap 文件与 ext4 的 lost+found，不可见也不可被写操作命中。
 // 只保护根目录这一层，子目录中的同名文件（如 <root>/backup/swapfile）不受影响。
-const FILE_ROOT_PROTECTED = new Set(['swapfile', 'lost+found']);
+const FILE_ROOT_PROTECTED = new Set(['swapfile', 'lost+found', '.gradle', 'android-sdk', 'fvm']);
 try {
   fs.mkdirSync(FILE_DIR, { recursive: true });
 } catch (e) {
