@@ -673,7 +673,9 @@ function readHistory() {
 // 长期留样数据库：独立文件，绝不与 Hermes 的 state.db 混用（ADMIN_METRICS_DB 可覆盖，便于测试隔离）
 const METRICS_DB_FILE =
   process.env.ADMIN_METRICS_DB || path.join(__dirname, '..', 'data', 'metrics.db');
-const METRICS_RETENTION_SECONDS = 180 * 24 * 3600; // raw 5s 点仅保留 3 天，超出自动删除
+const METRICS_RETENTION_SECONDS = 30 * 24 * 3600; // raw 5s 点保留 30 天（用户规则：30 天前数据不保留）
+const METRICS_1M_RETENTION_SECONDS = 90 * 24 * 3600; // 分钟桶保留 90 天
+// 小时桶 / 天桶长期保留：不随 raw 过期而删除（超 30 天、raw 已删的桶直接用物化值）
 
 // 留样点与旧 history 点同构（键名沿用采样器现有键名，保证前端图表无需改结构）
 const METRIC_KEYS = [
@@ -691,6 +693,38 @@ const METRIC_KEYS = [
   'disk_io_write'
 ];
 
+// 物化聚合表：每行 = 该桶内 raw 5s 样本按档位口径（分钟 Max / 小时 P90 / 天 P99）计算的值，
+// 绝不是对下层聚合结果再聚合。
+// - metrics_1m 分钟桶（保留 90 天）；metrics_1h 小时桶 / metrics_1d 天桶（长期保留）
+// - 三者都直接从 raw `metrics` 计算：1h / 1d 严禁由 1m 递归聚合
+// 分档口径（用户 2026-09-18 定稿）：分钟 = Max（峰值）、小时 = P90、天 = P99。
+// 三者一律从 raw 5s 样本直接计算，严禁由细粒度桶递归聚合；调整口径只改这里的 pct。
+// pct = 100 时取桶内最大值（等价 Max）；其余为最近秩分位 ceil(pct/100 * N)。
+const AGG_TABLES = {
+  '1m': { table: 'metrics_1m', stepSec: 60, retentionSec: METRICS_1M_RETENTION_SECONDS, pct: 100, label: 'max' },
+  '1h': { table: 'metrics_1h', stepSec: 3600, retentionSec: null, pct: 90, label: 'p90' },
+  '1d': { table: 'metrics_1d', stepSec: 86400, retentionSec: null, pct: 99, label: 'p99' }
+};
+const AGG_TABLE_LIST = Object.values(AGG_TABLES);
+
+// 物化值的小数位：与旧 AVG 查询保持一致，前端展示不变
+const METRIC_ROUND = {
+  cpu: 1,
+  mem_percent: 1,
+  mem_used: 0,
+  mem_total: 0,
+  swap_percent: 1,
+  psi_mem_avg10: 2,
+  psi_cpu_avg10: 2,
+  psi_io_avg10: 2,
+  net_rx_rate: 0,
+  net_tx_rate: 0,
+  disk_io_read: 0,
+  disk_io_write: 0
+};
+const AGG_COLUMNS = METRIC_KEYS.join(', ');
+const AGG_COLUMNS_CREATE = METRIC_KEYS.map((k) => `${k} REAL`).join(', ');
+
 // 可写打开 node:sqlite（懒加载 + 单例）。打开/建表失败只降级为「无长期留样」，
 // 绝不抛出到调用方，避免影响内存采样与 SSE。
 let metricsDb = null;
@@ -699,6 +733,15 @@ function openMetricsDb() {
   try {
     fs.mkdirSync(path.dirname(METRICS_DB_FILE), { recursive: true });
     const db = new DatabaseSync(METRICS_DB_FILE);
+    // 并发保护：采样每 5s 写一次，聚合补算会连续写大量分片。
+    // 不开 WAL / busy_timeout 时两者相撞会直接 SQLITE_BUSY（"database is locked"）导致整批聚合放弃。
+    try {
+      db.exec('PRAGMA journal_mode=WAL');
+      db.exec('PRAGMA busy_timeout=8000');
+      db.exec('PRAGMA synchronous=NORMAL');
+    } catch (e) {
+      console.warn('[admin-server] metrics.db PRAGMA 设置失败（继续运行）:', e.message);
+    }
     db.exec(
       'CREATE TABLE IF NOT EXISTS metrics (' +
         'ts INTEGER PRIMARY KEY,' +
@@ -707,6 +750,17 @@ function openMetricsDb() {
         'net_rx_rate REAL, net_tx_rate REAL, disk_io_read REAL, disk_io_write REAL' +
         ')'
     );
+    // 物化聚合表：字段与 raw 一致 + bucket_start(Unix 秒) / sample_count / updated_at
+    for (const t of AGG_TABLE_LIST) {
+      db.exec(
+        'CREATE TABLE IF NOT EXISTS ' + t.table + ' (' +
+          'bucket_start INTEGER PRIMARY KEY,' +
+          AGG_COLUMNS_CREATE + ',' +
+          'sample_count INTEGER,' +
+          'updated_at INTEGER' +
+          ')'
+      );
+    }
     metricsDb = db;
   } catch (e) {
     console.warn('[admin-server] metrics.db 打开失败，长期留样停用:', e.message);
@@ -761,37 +815,226 @@ const METRICS_RANGE_SECONDS = {
   '30d': 30 * 86400
 };
 
-// 分桶聚合（SQL GROUP BY，绝不把 raw 全量拉进 Node 再算）：取桶内平均，ts 为桶起始（毫秒）。
-// 返回与旧 history 同构的 points 数组。
+// 分档分位分桶（窗口函数，绝不把 raw 全量拉进 Node）：桶内 12 个指标各自独立排序，
+// 取「最近秩」第 ceil(pct/100 * N) 个样本（整数除法实现）；pct=100 即桶内最大值（Max）。
+// 分钟桶 pct=100、小时桶 pct=90、天桶 pct=99 —— 三者全部直接来自 raw，绝不递归。
+// 返回 [{bucket, sample_count, <metrics>}]。
+function computeAggRows(stepSec, pct, sinceSec, untilSec) {
+  const db = openMetricsDb();
+  if (!db) return [];
+  const rank = `(${pct} * cnt + 99) / 100`;
+  const rowNums = METRIC_KEYS.map(
+    (k) => `ROW_NUMBER() OVER (PARTITION BY bucket ORDER BY ${k}) AS r_${k}`
+  ).join(', ');
+  const p99 = METRIC_KEYS.map(
+    (k) => `ROUND(MAX(CASE WHEN r_${k} = ${rank} THEN ${k} END), ${METRIC_ROUND[k]}) AS ${k}`
+  ).join(', ');
+  const sql =
+    'WITH base AS (' +
+      'SELECT CAST(ts / ? AS INTEGER) * ? AS bucket, ' + AGG_COLUMNS + ' ' +
+      'FROM metrics WHERE ts >= ? AND ts < ?' +
+    '), ranked AS (' +
+      'SELECT bucket, COUNT(*) OVER (PARTITION BY bucket) AS cnt, ' + rowNums + ', ' + AGG_COLUMNS + ' ' +
+      'FROM base' +
+    ') SELECT bucket, MAX(cnt) AS sample_count, ' + p99 + ' FROM ranked GROUP BY bucket ORDER BY bucket';
+  return db.prepare(sql).all(stepSec, stepSec, sinceSec, untilSec);
+}
+
+// 物化表 upsert（INSERT OR REPLACE，幂等：已存在的桶覆盖更新）
+const aggStmtCache = new Map();
+function aggUpsertStmt(db, table) {
+  let stmt = aggStmtCache.get(table);
+  if (stmt) return stmt;
+  const placeholders = ['?', ...METRIC_KEYS.map(() => '?'), '?', '?'].join(', ');
+  stmt = db.prepare(
+    'INSERT OR REPLACE INTO ' + table +
+      ' (bucket_start, ' + AGG_COLUMNS + ', sample_count, updated_at) VALUES (' + placeholders + ')'
+  );
+  aggStmtCache.set(table, stmt);
+  return stmt;
+}
+
+// 计算并写入 [sinceSec, untilSec) 内的完整桶（必须与 step 对齐）
+function materializeRange(key, sinceSec, untilSec) {
+  const def = AGG_TABLES[key];
+  if (!def || untilSec <= sinceSec) return 0;
+  const rows = computeAggRows(def.stepSec, def.pct, sinceSec, untilSec);
+  if (!rows.length) return 0;
+  const db = openMetricsDb();
+  if (!db) return 0;
+  const stmt = aggUpsertStmt(db, def.table);
+  const now = Math.floor(Date.now() / 1000);
+  for (const r of rows) {
+    stmt.run(r.bucket, ...METRIC_KEYS.map((k) => r[k]), r.sample_count, now);
+  }
+  return rows.length;
+}
+
+// 补算「最近 N 个完整桶」（默认 1 个）。周期性任务回看多个桶实现自愈：
+// 幂等 upsert，重复计算代价极低；某次失败留下的空洞会在下一次回看时自动补上。
+function aggregateLastComplete(key, lookback = 1) {
+  const def = AGG_TABLES[key];
+  const nowSec = Math.floor(Date.now() / 1000);
+  const end = Math.floor(nowSec / def.stepSec) * def.stepSec; // 当前桶起点 = 完整桶上界（不含）
+  const start = Math.max(0, end - def.stepSec * Math.max(1, lookback));
+  if (end <= 0 || end <= start) return 0;
+  return materializeRange(key, start, end);
+}
+
+// 分钟桶过期清理（小时/天桶长期保留，不清理）
+function cleanupExpiredAggregates() {
+  const def = AGG_TABLES['1m'];
+  const db = openMetricsDb();
+  if (!db) return;
+  db.prepare('DELETE FROM ' + def.table + ' WHERE bucket_start < ?').run(
+    Math.floor(Date.now() / 1000) - def.retentionSec
+  );
+}
+
+// 启动补齐规划：只挑「raw 有数据但聚合表缺失」的桶，按连续区间分片；
+// 已有的桶一律跳过，绝不在启动时全表重算。
+const BACKFILL_CHUNK_BUCKETS = 512;
+function planBackfillJobs() {
+  const jobs = [];
+  const db = openMetricsDb();
+  if (!db) return jobs;
+  const raw = db.prepare('SELECT MIN(ts) mn FROM metrics').get();
+  if (!raw || raw.mn == null) return jobs;
+  const nowSec = Math.floor(Date.now() / 1000);
+  for (const [key, def] of Object.entries(AGG_TABLES)) {
+    try {
+      const end = Math.floor(nowSec / def.stepSec) * def.stepSec; // 完整桶上界（不含）
+      const floorStart = Math.floor(raw.mn / def.stepSec) * def.stepSec;
+      if (floorStart >= end) continue;
+      const have = new Set(
+        db
+          .prepare('SELECT bucket_start FROM ' + def.table + ' WHERE bucket_start >= ? AND bucket_start < ?')
+          .all(floorStart, end)
+          .map((r) => r.bucket_start)
+      );
+      const rawBuckets = db
+        .prepare(
+          'SELECT DISTINCT CAST(ts / ? AS INTEGER) * ? AS b FROM metrics ' +
+            'WHERE ts >= ? AND ts < ? ORDER BY b'
+        )
+        .all(def.stepSec, def.stepSec, floorStart, end);
+      const ranges = [];
+      let rangeStart = null;
+      let prev = null;
+      for (const r of rawBuckets) {
+        const b = r.b;
+        if (have.has(b)) {
+          if (rangeStart != null) {
+            ranges.push([rangeStart, prev]);
+            rangeStart = null;
+          }
+          continue;
+        }
+        if (rangeStart == null) rangeStart = b;
+        else if (b !== prev + def.stepSec) {
+          ranges.push([rangeStart, prev]);
+          rangeStart = b;
+        }
+        prev = b;
+      }
+      if (rangeStart != null) ranges.push([rangeStart, prev]);
+      const chunk = def.stepSec * BACKFILL_CHUNK_BUCKETS;
+      for (const [rs, re] of ranges) {
+        for (let s = rs; s <= re; s += chunk) {
+          jobs.push({ key, start: s, end: Math.min(re + def.stepSec, s + chunk) });
+        }
+      }
+    } catch (e) {
+      console.warn('[admin-server] 聚合补算规划失败(' + key + '):', e.message);
+    }
+  }
+  return jobs;
+}
+
+// 分片执行补算：每片之间 setImmediate 让出事件循环，避免长时间阻塞采样/SSE
+function runBackfill(jobs, idx) {
+  if (idx >= jobs.length) {
+    if (jobs.length) console.log('[admin-server] 聚合启动补算完成，共 ' + jobs.length + ' 个分片');
+    return;
+  }
+  const job = jobs[idx];
+  try {
+    materializeRange(job.key, job.start, job.end);
+  } catch (e) {
+    console.warn('[admin-server] 聚合补算失败(' + job.key + '):', e.message);
+  }
+  setImmediate(() => runBackfill(jobs, idx + 1));
+}
+
+// 聚合调度（仅在持有采样锁的实例上启动）：
+// - 启动补齐缺失桶（幂等，只补缺的）
+// - 每分钟补上一个完整分钟桶；每小时/每天各补一个完整桶（均直接读 raw 算 P99）
+// 每次聚合最外层 try/catch + warn，失败绝不影响采样与 SSE
+let aggregationScheduled = false;
+function startAggregationScheduler() {
+  if (aggregationScheduled) return;
+  aggregationScheduled = true;
+  setTimeout(() => {
+    try {
+      runBackfill(planBackfillJobs(), 0);
+    } catch (e) {
+      console.warn('[admin-server] 聚合启动补算失败，不影响采样/SSE:', e.message);
+    }
+  }, 1500).unref?.();
+  setInterval(() => {
+    try {
+      aggregateLastComplete('1m', 10); // 回看 10 个分钟桶：单次失败留下的空洞下次自动补上
+      cleanupExpiredAggregates();
+    } catch (e) {
+      console.warn('[admin-server] 分钟桶聚合失败，不影响采样/SSE:', e.message);
+    }
+  }, 60 * 1000).unref?.();
+  setInterval(() => {
+    try {
+      aggregateLastComplete('1h', 3); // 回看 3 个小时桶
+    } catch (e) {
+      console.warn('[admin-server] 小时桶聚合失败，不影响采样/SSE:', e.message);
+    }
+  }, 60 * 60 * 1000).unref?.();
+  setInterval(() => {
+    try {
+      aggregateLastComplete('1d', 2); // 回看 2 个天桶
+    } catch (e) {
+      console.warn('[admin-server] 天桶聚合失败，不影响采样/SSE:', e.message);
+    }
+  }, 24 * 60 * 60 * 1000).unref?.();
+}
+
+// 粒度查询：1m/1h/1d 读对应物化聚合表；5m 未物化，退回查询时对 raw 现算 P99（兼容旧参数）。
+// points 与旧 /history 同构；无数据返回空数组 + 完整 meta，绝不抛 500、绝不返回 null。
 function queryMetricPoints(range, step) {
   const stepSec = METRICS_STEP_SECONDS[step];
   const rangeSec = METRICS_RANGE_SECONDS[range];
-  const since = Math.floor(Date.now() / 1000) - rangeSec;
+  const nowSec = Math.floor(Date.now() / 1000);
+  const since = nowSec - rangeSec;
   const db = openMetricsDb();
-  if (!db) return [];
-  const rows = db
-    .prepare(
-      'SELECT CAST(ts / ? AS INTEGER) * ? AS bucket,' +
-        'ROUND(AVG(cpu), 1) AS cpu,' +
-        'ROUND(AVG(mem_percent), 1) AS mem_percent,' +
-        'ROUND(AVG(mem_used), 0) AS mem_used,' +
-        'ROUND(AVG(mem_total), 0) AS mem_total,' +
-        'ROUND(AVG(swap_percent), 1) AS swap_percent,' +
-        'ROUND(AVG(psi_mem_avg10), 2) AS psi_mem_avg10,' +
-        'ROUND(AVG(psi_cpu_avg10), 2) AS psi_cpu_avg10,' +
-        'ROUND(AVG(psi_io_avg10), 2) AS psi_io_avg10,' +
-        'ROUND(AVG(net_rx_rate), 0) AS net_rx_rate,' +
-        'ROUND(AVG(net_tx_rate), 0) AS net_tx_rate,' +
-        'ROUND(AVG(disk_io_read), 0) AS disk_io_read,' +
-        'ROUND(AVG(disk_io_write), 0) AS disk_io_write ' +
-        'FROM metrics WHERE ts > ? GROUP BY bucket ORDER BY bucket'
-    )
-    .all(stepSec, stepSec, since);
-  return rows.map((r) => {
+  const meta = { step, range, bucketCount: 0, firstBucket: null, lastBucket: null, recordedSeconds: 0 };
+  if (!db) return { points: [], meta };
+  const def = AGG_TABLES[step];
+  const rows = def
+    ? db
+        .prepare(
+          'SELECT bucket_start AS bucket, ' + AGG_COLUMNS + ' FROM ' + def.table +
+            ' WHERE bucket_start >= ? ORDER BY bucket_start'
+        )
+        .all(since)
+    : computeAggRows(stepSec, 95, since, nowSec + 1); // 未物化的档位（如 5m）现算，口径取 P95
+  const points = rows.map((r) => {
     const p = { ts: r.bucket * 1000 };
     for (const k of METRIC_KEYS) p[k] = r[k];
     return p;
   });
+  const raw = db.prepare('SELECT MIN(ts) mn FROM metrics').get();
+  if (raw && raw.mn != null) meta.recordedSeconds = Math.max(0, nowSec - raw.mn);
+  meta.bucketCount = points.length;
+  meta.firstBucket = points.length ? points[0].ts : null;
+  meta.lastBucket = points.length ? points[points.length - 1].ts : null;
+  return { points, meta };
 }
 
 // 采样器自身的上一次原始采样（用于计算两次采样之间的差值速率/使用率）
@@ -920,6 +1163,8 @@ if (acquireSamplerLock()) {
     }
   });
   console.log(`[admin-server] 历史采样器已启动（每 ${HISTORY_INTERVAL_MS / 1000}s 一次，最多 ${HISTORY_MAX} 点）`);
+  // 聚合调度与采样器同锁：仅主实例补算/物化聚合表，失败只 warn，绝不拖累采样与 SSE
+  startAggregationScheduler();
 }
 
 /* ============ 服务状态检测 ============ */
@@ -1334,19 +1579,23 @@ app.get('/api/admin/system/history', authRequired, (req, res) => {
   res.json(readHistory());
 });
 
-// 粒度聚合（需鉴权）：从长期留样 metrics.db 按 step 分桶取平均，返回与旧 history 同构的 points。
-// 未知 range/step 一律回退默认（1d / 1m）并返回 200；旧 /history 接口不受影响。
+// 粒度聚合（需鉴权）：1m/1h/1d 分别读物化聚合表（桶内 raw 5s 样本 P99），
+// points 与旧 /history 同构；额外返回 meta。未知 range/step 回退默认（1d/1m）并返回 200；
+// 无数据/单点也返回结构完整的 200（points 可为空、可为单点），绝不 500。
 app.get('/api/admin/system/metrics', authRequired, (req, res) => {
   const range = METRICS_RANGE_SECONDS[req.query.range] ? String(req.query.range) : '1d';
   const step = METRICS_STEP_SECONDS[req.query.step] ? String(req.query.step) : '1m';
   let points = [];
+  let meta = { step, range, bucketCount: 0, firstBucket: null, lastBucket: null, recordedSeconds: 0 };
   try {
-    points = queryMetricPoints(range, step);
+    const r = queryMetricPoints(range, step);
+    points = r.points;
+    meta = r.meta;
   } catch (e) {
-    // 查询失败不 500：降级为空数组，前端保持上一帧，不影响页面其余部分
+    // 查询失败不 500：降级为空数组 + 完整 meta，前端保持上一帧，不影响页面其余部分
     console.warn('[admin-server] metrics 查询失败:', e.message);
   }
-  res.json({ step, range, points });
+  res.json({ step, range, points, meta });
 });
 
 // SSE 实时快照（需鉴权）：系统信息 + 服务状态 + 历史采样合并推送。
