@@ -668,6 +668,132 @@ function readHistory() {
   return historyBuffer.slice(-HISTORY_MAX);
 }
 
+/* ============ 长期留样（独立 SQLite）+ 粒度聚合 ============ */
+
+// 长期留样数据库：独立文件，绝不与 Hermes 的 state.db 混用（ADMIN_METRICS_DB 可覆盖，便于测试隔离）
+const METRICS_DB_FILE =
+  process.env.ADMIN_METRICS_DB || path.join(__dirname, '..', 'data', 'metrics.db');
+const METRICS_RETENTION_SECONDS = 180 * 24 * 3600; // raw 5s 点仅保留 3 天，超出自动删除
+
+// 留样点与旧 history 点同构（键名沿用采样器现有键名，保证前端图表无需改结构）
+const METRIC_KEYS = [
+  'cpu',
+  'mem_percent',
+  'mem_used',
+  'mem_total',
+  'swap_percent',
+  'psi_mem_avg10',
+  'psi_cpu_avg10',
+  'psi_io_avg10',
+  'net_rx_rate',
+  'net_tx_rate',
+  'disk_io_read',
+  'disk_io_write'
+];
+
+// 可写打开 node:sqlite（懒加载 + 单例）。打开/建表失败只降级为「无长期留样」，
+// 绝不抛出到调用方，避免影响内存采样与 SSE。
+let metricsDb = null;
+function openMetricsDb() {
+  if (metricsDb) return metricsDb;
+  try {
+    fs.mkdirSync(path.dirname(METRICS_DB_FILE), { recursive: true });
+    const db = new DatabaseSync(METRICS_DB_FILE);
+    db.exec(
+      'CREATE TABLE IF NOT EXISTS metrics (' +
+        'ts INTEGER PRIMARY KEY,' +
+        'cpu REAL, mem_percent REAL, mem_used REAL, mem_total REAL, swap_percent REAL,' +
+        'psi_mem_avg10 REAL, psi_cpu_avg10 REAL, psi_io_avg10 REAL,' +
+        'net_rx_rate REAL, net_tx_rate REAL, disk_io_read REAL, disk_io_write REAL' +
+        ')'
+    );
+    metricsDb = db;
+  } catch (e) {
+    console.warn('[admin-server] metrics.db 打开失败，长期留样停用:', e.message);
+    metricsDb = null;
+  }
+  return metricsDb;
+}
+
+// 写入一个 raw 采样点（ts 用 epoch 秒）。任何异常只 warn，不抛出：
+// 写库失败不能拖累现有 SSE 与内存采样。
+function persistMetricPoint(point) {
+  const db = openMetricsDb();
+  if (!db) return;
+  try {
+    db.prepare(
+      'INSERT OR REPLACE INTO metrics (' +
+        'ts, cpu, mem_percent, mem_used, mem_total, swap_percent,' +
+        'psi_mem_avg10, psi_cpu_avg10, psi_io_avg10,' +
+        'net_rx_rate, net_tx_rate, disk_io_read, disk_io_write' +
+        ') VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+    ).run(
+      Math.floor(point.ts / 1000),
+      point.cpu,
+      point.mem_percent,
+      point.mem_used,
+      point.mem_total,
+      point.swap_percent,
+      point.psi_mem_avg10,
+      point.psi_cpu_avg10,
+      point.psi_io_avg10,
+      point.net_rx_rate,
+      point.net_tx_rate,
+      point.disk_io_read,
+      point.disk_io_write
+    );
+    // 保留策略：每次写入顺手清理超过 3 天的 raw 点（ts 是主键，走 rowid 顺序，代价极低）
+    db.prepare('DELETE FROM metrics WHERE ts < ?').run(
+      Math.floor(Date.now() / 1000) - METRICS_RETENTION_SECONDS
+    );
+  } catch (e) {
+    console.warn('[admin-server] metrics.db 写入失败:', e.message);
+  }
+}
+
+// 粒度/区间白名单：未知参数回退默认（range=1d & step=1m），并正常返回 200
+const METRICS_STEP_SECONDS = { '1m': 60, '5m': 300, '1h': 3600, '1d': 86400 };
+const METRICS_RANGE_SECONDS = {
+  '1h': 3600,
+  '6h': 6 * 3600,
+  '1d': 86400,
+  '7d': 7 * 86400,
+  '30d': 30 * 86400
+};
+
+// 分桶聚合（SQL GROUP BY，绝不把 raw 全量拉进 Node 再算）：取桶内平均，ts 为桶起始（毫秒）。
+// 返回与旧 history 同构的 points 数组。
+function queryMetricPoints(range, step) {
+  const stepSec = METRICS_STEP_SECONDS[step];
+  const rangeSec = METRICS_RANGE_SECONDS[range];
+  const since = Math.floor(Date.now() / 1000) - rangeSec;
+  const db = openMetricsDb();
+  if (!db) return [];
+  const rows = db
+    .prepare(
+      'SELECT CAST(ts / ? AS INTEGER) * ? AS bucket,' +
+        'ROUND(AVG(cpu), 1) AS cpu,' +
+        'ROUND(AVG(mem_percent), 1) AS mem_percent,' +
+        'ROUND(AVG(mem_used), 0) AS mem_used,' +
+        'ROUND(AVG(mem_total), 0) AS mem_total,' +
+        'ROUND(AVG(swap_percent), 1) AS swap_percent,' +
+        'ROUND(AVG(psi_mem_avg10), 2) AS psi_mem_avg10,' +
+        'ROUND(AVG(psi_cpu_avg10), 2) AS psi_cpu_avg10,' +
+        'ROUND(AVG(psi_io_avg10), 2) AS psi_io_avg10,' +
+        'ROUND(AVG(net_rx_rate), 0) AS net_rx_rate,' +
+        'ROUND(AVG(net_tx_rate), 0) AS net_tx_rate,' +
+        'ROUND(AVG(disk_io_read), 0) AS disk_io_read,' +
+        'ROUND(AVG(disk_io_write), 0) AS disk_io_write ' +
+        'FROM metrics WHERE ts > ? GROUP BY bucket ORDER BY bucket'
+    )
+    .all(stepSec, stepSec, since);
+  return rows.map((r) => {
+    const p = { ts: r.bucket * 1000 };
+    for (const k of METRIC_KEYS) p[k] = r[k];
+    return p;
+  });
+}
+
 // 采样器自身的上一次原始采样（用于计算两次采样之间的差值速率/使用率）
 let histCpuPrev = null
 let histCpuEma = null // history CPU 滑动平均;
@@ -755,8 +881,10 @@ function sampleHistory() {
   histDiskioPrev = { ts: now, read: io.read, write: io.write };
 
   const psi = psiHistPoint();
+  const mem = readMeminfo(); // 长期留样额外记录内存绝对量（mem_used / mem_total）
 
-  historyBuffer.push({
+  // 内存 buffer / 旧 history 接口的结构保持不变（不加任何新键）
+  const point = {
     ts: now,
     cpu: cpuPercent,
     mem_percent: memPercent(),
@@ -768,10 +896,14 @@ function sampleHistory() {
     net_tx_rate: Math.round(netTxRate),
     disk_io_read: Math.round(ioReadRate),
     disk_io_write: Math.round(ioWriteRate)
-  });
+  };
+
+  historyBuffer.push(point);
   if (historyBuffer.length > HISTORY_MAX) historyBuffer.shift();
 
   persistHistory();
+  // 同步长期留样（写库失败只 warn，不影响上面的内存 buffer 与 SSE）
+  persistMetricPoint({ ...point, mem_used: mem.used, mem_total: mem.total });
 }
 
 // 启动采样器：仅在持有锁的实例上运行（避免多实例重复采样）。
@@ -1196,9 +1328,25 @@ app.get('/api/admin/system', authRequired, async (req, res) => {
   }
 });
 
-// 历史采样（需鉴权）。返回环形 buffer 中的采样点（最多 120 点），多实例共享
+// 历史采样（需鉴权）。返回环形 buffer 中的采样点（最多 120 点），多实例共享。
+// 行为保持不变：只读内存/文件 buffer，不涉及新增的 metrics.db。
 app.get('/api/admin/system/history', authRequired, (req, res) => {
   res.json(readHistory());
+});
+
+// 粒度聚合（需鉴权）：从长期留样 metrics.db 按 step 分桶取平均，返回与旧 history 同构的 points。
+// 未知 range/step 一律回退默认（1d / 1m）并返回 200；旧 /history 接口不受影响。
+app.get('/api/admin/system/metrics', authRequired, (req, res) => {
+  const range = METRICS_RANGE_SECONDS[req.query.range] ? String(req.query.range) : '1d';
+  const step = METRICS_STEP_SECONDS[req.query.step] ? String(req.query.step) : '1m';
+  let points = [];
+  try {
+    points = queryMetricPoints(range, step);
+  } catch (e) {
+    // 查询失败不 500：降级为空数组，前端保持上一帧，不影响页面其余部分
+    console.warn('[admin-server] metrics 查询失败:', e.message);
+  }
+  res.json({ step, range, points });
 });
 
 // SSE 实时快照（需鉴权）：系统信息 + 服务状态 + 历史采样合并推送。
