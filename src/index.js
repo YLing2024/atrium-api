@@ -195,19 +195,11 @@ async function authRequired(req, res, next) {
     const stored = await redis.get(sessionKey(token));
     if (!stored || stored !== token) {
       // Redis 会话校验未通过：回退查接口令牌（固定过期、不滑动续期，直连场景也可用）
-      const apiKey = API_TOKEN_PREFIX + sha256hex(token);
-      const raw = await redis.get(apiKey);
-      if (!raw) return res.status(401).json({ error: '未登录或会话已过期' });
-      let meta;
-      try {
-        meta = JSON.parse(raw);
-      } catch (e) {
-        return res.status(401).json({ error: '未登录或会话已过期' });
-      }
-      if (!meta || typeof meta.name !== 'string' || !meta.name) {
-        return res.status(401).json({ error: '未登录或会话已过期' });
-      }
-      req.user = { role: 'admin', name: meta.name, via: 'api-token' };
+      // 与 notificationsWriteAuth 共用 lookupApiTokenMeta，避免两处比对逻辑漂移
+      const meta = await lookupApiTokenMeta(token);
+      if (!meta) return res.status(401).json({ error: '未登录或会话已过期' });
+      // canWrite 为令牌元数据新增字段：缺省（老令牌）视为只读，绝不放宽已有令牌权限
+      req.user = { role: 'admin', name: meta.name, via: 'api-token', canWrite: meta.canWrite === true };
       return next();
     }
     await redis.expire(sessionKey(token), SESSION_TTL); // 滑动续期
@@ -1167,6 +1159,153 @@ if (acquireSamplerLock()) {
   startAggregationScheduler();
 }
 
+/* ============ 通知中心（notifications） ============ */
+// 与飞书并存的「归档 + 工作台」：飞书负责叫醒，这里负责能看、能筛、能标已读。
+// 独立 SQLite（与 metrics.db 分开，ADMIN_NOTIFICATIONS_DB 可覆盖，便于测试隔离）。
+// ts / read_at 均为 epoch 秒（与 metrics 表口径一致；SSE 心跳同样用秒）。
+
+const NOTIFICATIONS_DB_FILE =
+  process.env.ADMIN_NOTIFICATIONS_DB || path.join(__dirname, '..', 'data', 'notifications.db');
+const NOTIFICATIONS_RETENTION_SECONDS = 30 * 24 * 3600; // 保留 30 天（与日志保留策略一致）
+const NOTIFICATIONS_DEDUP_WINDOW_SECONDS = 10 * 60; // 同一 dedupKey 10 分钟内只保留一条
+const NOTIFICATIONS_HEARTBEAT_MS = 25000; // SSE 心跳 25s（需求区间 20~30s）
+const NOTIFICATION_LEVELS = new Set(['urgent', 'normal', 'digest']);
+
+// 可写打开 node:sqlite（懒加载 + 单例）。打开/建表失败只降级，绝不抛到调用方。
+let notificationsDb = null;
+function openNotificationsDb() {
+  if (notificationsDb) return notificationsDb;
+  try {
+    fs.mkdirSync(path.dirname(NOTIFICATIONS_DB_FILE), { recursive: true });
+    const db = new DatabaseSync(NOTIFICATIONS_DB_FILE);
+    // 与 metrics.db 同样的并发保护：写入与清理可能交叉
+    try {
+      db.exec('PRAGMA journal_mode=WAL');
+      db.exec('PRAGMA busy_timeout=8000');
+      db.exec('PRAGMA synchronous=NORMAL');
+    } catch (e) {
+      console.warn('[admin-server] notifications.db PRAGMA 设置失败（继续运行）:', e.message);
+    }
+    db.exec(
+      'CREATE TABLE IF NOT EXISTS notifications (' +
+        'id INTEGER PRIMARY KEY AUTOINCREMENT,' +
+        'ts INTEGER NOT NULL,' +
+        'level TEXT NOT NULL,' +
+        'source TEXT NOT NULL,' +
+        'title TEXT NOT NULL,' +
+        'body TEXT,' +
+        'link TEXT,' +
+        'dedup_key TEXT,' +
+        'read_at INTEGER' +
+        ')'
+    );
+    db.exec('CREATE INDEX IF NOT EXISTS idx_notifications_ts ON notifications(ts DESC)');
+    db.exec('CREATE INDEX IF NOT EXISTS idx_notifications_read_at ON notifications(read_at)');
+    db.exec('CREATE INDEX IF NOT EXISTS idx_notifications_dedup_key ON notifications(dedup_key)');
+    // 统计/按来源筛选用（仅加索引，不改列）
+    db.exec('CREATE INDEX IF NOT EXISTS idx_notifications_source ON notifications(source)');
+    notificationsDb = db;
+  } catch (e) {
+    console.warn('[admin-server] notifications.db 打开失败，通知中心停用:', e.message);
+    notificationsDb = null;
+  }
+  return notificationsDb;
+}
+
+// 库内行 → 接口契约 item（字段名严格固定；dedup_key 不外泄）
+function notificationView(row) {
+  return {
+    id: Number(row.id),
+    ts: Number(row.ts),
+    level: row.level,
+    source: row.source,
+    title: row.title,
+    body: row.body,
+    link: row.link,
+    readAt: row.read_at == null ? null : Number(row.read_at)
+  };
+}
+
+// 清理 30 天前的通知。启动时一次 + 每小时一次；失败只 warn，不影响其它接口。
+function cleanupNotifications() {
+  const db = openNotificationsDb();
+  if (!db) return;
+  try {
+    const cutoff = Math.floor(Date.now() / 1000) - NOTIFICATIONS_RETENTION_SECONDS;
+    db.prepare('DELETE FROM notifications WHERE ts < ?').run(cutoff);
+  } catch (e) {
+    console.warn('[admin-server] 通知清理失败（不影响其它接口）:', e.message);
+  }
+}
+
+function startNotificationMaintenance() {
+  cleanupNotifications();
+  const timer = setInterval(cleanupNotifications, 60 * 60 * 1000);
+  timer.unref?.();
+}
+
+startNotificationMaintenance();
+
+// SSE 订阅者集合：新通知入库后立即广播；连接断开必须移除（不泄漏监听器）
+const notificationClients = new Set();
+
+function broadcastNotification(item) {
+  const frame = 'event: notification\ndata: ' + JSON.stringify(item) + '\n\n';
+  for (const res of notificationClients) {
+    try {
+      res.write(frame);
+    } catch (e) {
+      notificationClients.delete(res);
+    }
+  }
+}
+
+// 写入接口鉴权：仅「直连回环地址」的本机脚本免 SSO。
+// 注意 admin-server 只监听 127.0.0.1，经 nginx 反代的请求 socket 也是回环，
+// 但 nginx 必然注入 X-Real-IP / X-Forwarded-For；据此把它们继续交给 authRequired，
+// 避免把写入接口做成事实上的完全公开。
+function isDirectLoopback(req) {
+  const addr = ((req.socket && req.socket.remoteAddress) || '').replace(/^::ffff:/, '');
+  if (addr !== '127.0.0.1' && addr !== '::1') return false;
+  if (req.headers['x-real-ip'] || req.headers['x-forwarded-for']) return false;
+  return true;
+}
+
+// 从请求中提取 API 令牌明文：Authorization: Bearer 优先，兼容 X-Quotahub-Token 与 ?token=（与 authRequired 降级分支一致）
+function requestApiToken(req) {
+  const header = req.headers.authorization || '';
+  if (header.startsWith('Bearer ')) {
+    const t = header.slice(7).trim();
+    if (t) return t;
+  }
+  const alias = req.get('x-quotahub-token');
+  if (alias && String(alias).trim()) return String(alias).trim();
+  const queryToken = req.query && req.query.token ? String(req.query.token) : null;
+  return queryToken && queryToken.trim() ? queryToken.trim() : null;
+}
+
+async function notificationsWriteAuth(req, res, next) {
+  if (isDirectLoopback(req)) return next();
+  // 显式识别「本次请求是否用 API Token」：经 nginx 的请求带 X-Auth-User，authRequired 会走
+  // 「信任头部」路径、req.user 无 via/canWrite，只读令牌会绕过闸门，故这里独立查令牌表。
+  const token = requestApiToken(req);
+  if (token) {
+    let meta;
+    try {
+      meta = await lookupApiTokenMeta(token);
+    } catch (e) {
+      return res.status(500).json({ error: '会话服务异常' });
+    }
+    if (meta) {
+      // 命中 API 令牌表：只有 canWrite=true 才放行，否则 403（沿用原中文文案）
+      if (meta.canWrite === true) return next();
+      return res.status(403).json({ error: '该接口令牌为只读，无权写入通知' });
+    }
+  }
+  // 不是 API 令牌（SSO 会话 / 其它）→ 走原有鉴权逻辑，不受影响
+  return authRequired(req, res, next);
+}
+
 /* ============ 服务状态检测 ============ */
 
 // 待检测服务：端口监听判定 up/down。admin-server 为自身（恒 up，pid 为本进程）
@@ -1426,6 +1565,17 @@ function parseApiTokenMeta(raw) {
   }
 }
 
+// 按明文 token 查 API 令牌表：命中返回 meta，未命中/数据异常返回 null。
+// authRequired 的降级分支与 notificationsWriteAuth 的 canWrite 闸门共用此函数（唯一比对入口）。
+// 注意：不在此吞掉 Redis 异常，交由各自调用方 try/catch 决定 500 还是 401。
+async function lookupApiTokenMeta(token) {
+  if (!token) return null;
+  const raw = await redis.get(API_TOKEN_PREFIX + sha256hex(token));
+  const meta = parseApiTokenMeta(raw);
+  if (!meta || typeof meta.name !== 'string' || !meta.name) return null;
+  return meta;
+}
+
 // GET /api/admin/api-tokens —— 列表（绝不含 token 明文），按 createdAt 倒序
 app.get('/api/admin/api-tokens', authRequired, async (req, res) => {
   const ip = clientIp(req);
@@ -1441,7 +1591,9 @@ app.get('/api/admin/api-tokens', authRequired, async (req, res) => {
         note: meta.note || '',
         createdAt: Number(meta.createdAt) || 0,
         expiresAt: Number(meta.expiresAt) || 0,
-        lastUsedAt: Number(meta.lastUsedAt) || 0
+        lastUsedAt: Number(meta.lastUsedAt) || 0,
+        // 老令牌无此字段 → 只读（false），行为与新增前一致
+        canWrite: meta.canWrite === true
       });
     }
     tokens.sort((a, b) => b.createdAt - a.createdAt);
@@ -1471,9 +1623,11 @@ app.post('/api/admin/api-tokens', authRequired, async (req, res) => {
     const id = sha256hex(token); // id = sha256 全文
     const now = Date.now();
     const expiresAt = now + days * 86400000;
-    const meta = { id, name, note, createdAt: now, expiresAt, lastUsedAt: 0 };
+    // canWrite：新增的可写标志（只加字段，不改已有字段）；默认 false = 只读
+    const canWrite = req.body && req.body.canWrite === true;
+    const meta = { id, name, note, createdAt: now, expiresAt, lastUsedAt: 0, canWrite };
     await redis.set(apiTokenKey(id), JSON.stringify(meta), 'EX', days * 86400); // 固定过期，不滑动
-    auditLog('api_tokens_create', ip, true, `id=${id} name=${name} days=${days}`);
+    auditLog('api_tokens_create', ip, true, `id=${id} name=${name} days=${days} canWrite=${canWrite}`);
     return res.json({ id, token, meta });
   } catch (e) {
     auditLog('api_tokens_create', ip, false, e.message);
@@ -1497,6 +1651,7 @@ app.patch('/api/admin/api-tokens/:id', authRequired, async (req, res) => {
       meta.name = name;
     }
     if (body.note != null) meta.note = String(body.note).trim();
+    if (body.canWrite != null) meta.canWrite = body.canWrite === true;
     if (body.expiresInDays != null) {
       const days = Number(body.expiresInDays);
       if (!Number.isInteger(days) || days < 1 || days > API_TOKEN_MAX_DAYS) {
@@ -1513,7 +1668,8 @@ app.patch('/api/admin/api-tokens/:id', authRequired, async (req, res) => {
       note: meta.note,
       createdAt: Number(meta.createdAt),
       expiresAt: Number(meta.expiresAt),
-      lastUsedAt: Number(meta.lastUsedAt)
+      lastUsedAt: Number(meta.lastUsedAt),
+      canWrite: meta.canWrite === true
     });
   } catch (e) {
     auditLog('api_tokens_update', ip, false, e.message);
@@ -1642,6 +1798,262 @@ app.get('/api/admin/system/stream', authRequired, (req, res) => {
 
   // 客户端断开 / 切走 Tab：停表，不再推送
   req.on('close', () => clearInterval(timer));
+});
+
+/* ============ 通知中心 · REST / SSE 路由 ============ */
+
+// 写入通知（本机脚本免 SSO；其余来源走 authRequired）。
+// body: { level, source, title, body?, link?, dedupKey? } → 201 { id, ts }
+app.post('/api/admin/notifications', notificationsWriteAuth, (req, res) => {
+  const db = openNotificationsDb();
+  if (!db) return res.status(503).json({ error: '通知库暂不可用' });
+  const ip = clientIp(req);
+  const b = req.body || {};
+  const level = typeof b.level === 'string' ? b.level.trim() : '';
+  const source = typeof b.source === 'string' ? b.source.trim() : '';
+  const title = typeof b.title === 'string' ? b.title.trim() : '';
+  const body = typeof b.body === 'string' && b.body !== '' ? b.body : null;
+  const link = typeof b.link === 'string' && b.link !== '' ? b.link : null;
+  const dedupKey = typeof b.dedupKey === 'string' && b.dedupKey !== '' ? b.dedupKey : null;
+  if (!NOTIFICATION_LEVELS.has(level)) {
+    return res.status(400).json({ error: 'level 必须是 urgent / normal / digest' });
+  }
+  if (!source || !title) {
+    return res.status(400).json({ error: 'source 与 title 不能为空' });
+  }
+  const now = Math.floor(Date.now() / 1000);
+  try {
+    if (dedupKey) {
+      // 同一 dedupKey 10 分钟内只保留一条：更新 ts 与内容，不新增；重新置为未读
+      const existing = db
+        .prepare(
+          'SELECT id FROM notifications WHERE dedup_key = ? AND ts >= ? ORDER BY id DESC LIMIT 1'
+        )
+        .get(dedupKey, now - NOTIFICATIONS_DEDUP_WINDOW_SECONDS);
+      if (existing) {
+        db.prepare(
+          'UPDATE notifications SET ts=?, level=?, source=?, title=?, body=?, link=?, read_at=NULL WHERE id=?'
+        ).run(now, level, source, title, body, link, existing.id);
+        const item = notificationView(
+          db.prepare('SELECT * FROM notifications WHERE id = ?').get(existing.id)
+        );
+        broadcastNotification(item);
+        auditLog('notification_write', ip, true, `dedup id=${existing.id} level=${level} source=${source}`);
+        return res.status(201).json({ id: Number(existing.id), ts: now });
+      }
+    }
+    const info = db
+      .prepare(
+        'INSERT INTO notifications (ts, level, source, title, body, link, dedup_key, read_at) VALUES (?, ?, ?, ?, ?, ?, ?, NULL)'
+      )
+      .run(now, level, source, title, body, link, dedupKey);
+    const id = Number(info.lastInsertRowid);
+    const item = notificationView(db.prepare('SELECT * FROM notifications WHERE id = ?').get(id));
+    broadcastNotification(item);
+    auditLog('notification_write', ip, true, `id=${id} level=${level} source=${source}`);
+    return res.status(201).json({ id, ts: now });
+  } catch (e) {
+    auditLog('notification_write', ip, false, e.message);
+    return res.status(500).json({ error: '写入通知失败' });
+  }
+});
+
+// 列表（需鉴权）：支持 limit / before / level / source / unread；unread 与 total 为全库计数
+app.get('/api/admin/notifications', authRequired, (req, res) => {
+  const db = openNotificationsDb();
+  if (!db) return res.status(503).json({ error: '通知库暂不可用' });
+  try {
+    const limitRaw = parseInt(req.query.limit, 10);
+    const limit = Number.isFinite(limitRaw) ? Math.min(200, Math.max(1, limitRaw)) : 50;
+    const beforeRaw = parseInt(req.query.before, 10);
+    const before = Number.isFinite(beforeRaw) ? beforeRaw : null;
+    const level = NOTIFICATION_LEVELS.has(String(req.query.level || ''))
+      ? String(req.query.level)
+      : null;
+    const source =
+      req.query.source && String(req.query.source).trim() ? String(req.query.source).trim() : null;
+    const unreadOnly = String(req.query.unread || '') === '1';
+
+    const where = [];
+    const args = [];
+    if (level) {
+      where.push('level = ?');
+      args.push(level);
+    }
+    if (source) {
+      where.push('source = ?');
+      args.push(source);
+    }
+    if (before != null) {
+      where.push('id < ?');
+      args.push(before);
+    }
+    if (unreadOnly) where.push('read_at IS NULL');
+    const sql =
+      'SELECT * FROM notifications' +
+      (where.length ? ' WHERE ' + where.join(' AND ') : '') +
+      ' ORDER BY id DESC LIMIT ?';
+    args.push(limit);
+    const items = db.prepare(sql).all(...args).map(notificationView);
+    const unread = Number(
+      db.prepare('SELECT COUNT(*) AS n FROM notifications WHERE read_at IS NULL').get().n
+    );
+    const total = Number(db.prepare('SELECT COUNT(*) AS n FROM notifications').get().n);
+    res.json({ items, unread, total });
+  } catch (e) {
+    res.status(500).json({ error: '获取通知失败' });
+  }
+});
+
+// 单条已读（需鉴权）
+app.post('/api/admin/notifications/:id/read', authRequired, (req, res) => {
+  const db = openNotificationsDb();
+  if (!db) return res.status(503).json({ error: '通知库暂不可用' });
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isFinite(id)) return res.status(400).json({ error: '无效的 id' });
+  try {
+    db.prepare('UPDATE notifications SET read_at = ? WHERE id = ? AND read_at IS NULL').run(
+      Math.floor(Date.now() / 1000),
+      id
+    );
+    auditLog('notification_read', clientIp(req), true, `id=${id}`);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: '标记已读失败' });
+  }
+});
+
+// 全部已读（需鉴权）→ { ok: true, count: N }
+app.post('/api/admin/notifications/read-all', authRequired, (req, res) => {
+  const db = openNotificationsDb();
+  if (!db) return res.status(503).json({ error: '通知库暂不可用' });
+  try {
+    const info = db
+      .prepare('UPDATE notifications SET read_at = ? WHERE read_at IS NULL')
+      .run(Math.floor(Date.now() / 1000));
+    const count = Number(info.changes);
+    auditLog('notification_read_all', clientIp(req), true, `count=${count}`);
+    res.json({ ok: true, count });
+  } catch (e) {
+    res.status(500).json({ error: '全部已读失败' });
+  }
+});
+
+// 删除（需鉴权）
+app.delete('/api/admin/notifications/:id', authRequired, (req, res) => {
+  const db = openNotificationsDb();
+  if (!db) return res.status(503).json({ error: '通知库暂不可用' });
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isFinite(id)) return res.status(400).json({ error: '无效的 id' });
+  try {
+    db.prepare('DELETE FROM notifications WHERE id = ?').run(id);
+    auditLog('notification_delete', clientIp(req), true, `id=${id}`);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: '删除通知失败' });
+  }
+});
+
+// 批量删除（需鉴权）：按筛选一次删除多条。
+// body: { level?, source?, unreadOnly?, readOnly?, dryRun? } → { ok: true, count: N }
+// dryRun=true 只统计、不删除，供前端二次确认时拿到准确条数（新增可选字段）。
+// 注意：不带任何条件即「全部删除」；审计只记条数与筛选，绝不记 body。
+app.post('/api/admin/notifications/bulk-delete', authRequired, (req, res) => {
+  const db = openNotificationsDb();
+  if (!db) return res.status(503).json({ error: '通知库暂不可用' });
+  const b = req.body || {};
+  const level = NOTIFICATION_LEVELS.has(String(b.level || '')) ? String(b.level) : null;
+  const source = typeof b.source === 'string' && b.source.trim() ? b.source.trim() : null;
+  const unreadOnly = b.unreadOnly === true;
+  const readOnly = b.readOnly === true;
+  const dryRun = b.dryRun === true;
+  // 未读与已读互斥：同时给出时不匹配任何行，避免误删
+  if (unreadOnly && readOnly) return res.json({ ok: true, count: 0 });
+  const where = [];
+  const args = [];
+  if (level) {
+    where.push('level = ?');
+    args.push(level);
+  }
+  if (source) {
+    where.push('source = ?');
+    args.push(source);
+  }
+  if (unreadOnly) where.push('read_at IS NULL');
+  if (readOnly) where.push('read_at IS NOT NULL');
+  const whereSql = where.length ? ' WHERE ' + where.join(' AND ') : '';
+  try {
+    let count;
+    if (dryRun) {
+      count = Number(db.prepare('SELECT COUNT(*) AS n FROM notifications' + whereSql).get(...args).n);
+    } else {
+      const info = db.prepare('DELETE FROM notifications' + whereSql).run(...args);
+      count = Number(info.changes);
+      auditLog(
+        'notification_bulk_delete',
+        clientIp(req),
+        true,
+        `count=${count} level=${level || '-'} source=${source || '-'} unreadOnly=${unreadOnly} readOnly=${readOnly}`
+      );
+    }
+    res.json({ ok: true, count });
+  } catch (e) {
+    auditLog('notification_bulk_delete', clientIp(req), false, e.message);
+    res.status(500).json({ error: '批量删除失败' });
+  }
+});
+
+// 统计（需鉴权）→ { total, unread, sources: [{ source, count }] }
+// sources 按条数降序（来源相同时按字典序），前端只展示 Top 5。
+app.get('/api/admin/notifications/stats', authRequired, (req, res) => {
+  const db = openNotificationsDb();
+  if (!db) return res.status(503).json({ error: '通知库暂不可用' });
+  try {
+    const total = Number(db.prepare('SELECT COUNT(*) AS n FROM notifications').get().n);
+    const unread = Number(
+      db.prepare('SELECT COUNT(*) AS n FROM notifications WHERE read_at IS NULL').get().n
+    );
+    const sources = db
+      .prepare(
+        'SELECT source, COUNT(*) AS count FROM notifications GROUP BY source ORDER BY count DESC, source ASC'
+      )
+      .all()
+      .map((r) => ({ source: r.source, count: Number(r.count) }));
+    res.json({ total, unread, sources });
+  } catch (e) {
+    res.status(500).json({ error: '获取通知统计失败' });
+  }
+});
+
+// SSE 实时流（需鉴权）：另开一条，绝不复用系统指标 /system/stream。
+// event: notification（新通知 item） / heartbeat（每 25s）
+app.get('/api/admin/notifications/stream', authRequired, (req, res) => {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no'
+  });
+  res.flushHeaders();
+  res.write('retry: 5000\n\n');
+
+  notificationClients.add(res);
+  // 广播时可能遇到已断开的 socket，兜底吞掉 error，避免进程级未捕获异常
+  res.on('error', () => notificationClients.delete(res));
+  const hb = setInterval(() => {
+    try {
+      res.write('event: heartbeat\ndata: ' + JSON.stringify({ ts: Math.floor(Date.now() / 1000) }) + '\n\n');
+    } catch (e) {
+      notificationClients.delete(res);
+    }
+  }, NOTIFICATIONS_HEARTBEAT_MS);
+  hb.unref?.();
+
+  // 客户端断开：停心跳并移除订阅者，不泄漏监听器
+  req.on('close', () => {
+    clearInterval(hb);
+    notificationClients.delete(res);
+  });
 });
 
 // 软件版本监控（需鉴权）：只采集本地当前版本，不查外部 latest 接口
