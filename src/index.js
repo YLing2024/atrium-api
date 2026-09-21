@@ -1204,6 +1204,38 @@ function openNotificationsDb() {
     db.exec('CREATE INDEX IF NOT EXISTS idx_notifications_dedup_key ON notifications(dedup_key)');
     // 统计/按来源筛选用（仅加索引，不改列）
     db.exec('CREATE INDEX IF NOT EXISTS idx_notifications_source ON notifications(source)');
+    // 通知类别注册表：类别由服务端定义，客户端只拉取渲染（客户端不得内置任何类别清单）。
+    // 软删用 archived_at（不物理删除，避免历史通知失去归属）。
+    db.exec(
+      'CREATE TABLE IF NOT EXISTS notification_types (' +
+        'key TEXT PRIMARY KEY,' +
+        'label TEXT NOT NULL,' +
+        'description TEXT,' +
+        'default_level TEXT,' +
+        'sort INTEGER DEFAULT 0,' +
+        'enabled INTEGER DEFAULT 1,' +
+        'archived_at INTEGER' +
+        ')'
+    );
+    // 通知行增加类别列：历史库没有该列 → 加列；旧行按「type 缺省用 source」回填，
+    // 保证旧数据也能按类别查到（不改 source 语义）。
+    const notifCols = db.prepare('PRAGMA table_info(notifications)').all();
+    if (!notifCols.some((c) => c.name === 'type')) {
+      db.exec('ALTER TABLE notifications ADD COLUMN type TEXT');
+      db.exec('UPDATE notifications SET type = source WHERE type IS NULL');
+    }
+    db.exec('CREATE INDEX IF NOT EXISTS idx_notifications_type ON notifications(type)');
+    // 预置类别（仅缺省时插入，绝不覆盖后台已改的 label / 排序 / 停用状态）：
+    // watchdog=看门狗、monitor=站点监控、cron=定时播报、hermes=Hermes、admin=管理后台。
+    const seedType = db.prepare(
+      'INSERT OR IGNORE INTO notification_types (key, label, description, default_level, sort, enabled, archived_at) ' +
+        'VALUES (?, ?, NULL, ?, ?, 1, NULL)'
+    );
+    seedType.run('watchdog', '看门狗', 'urgent', 10);
+    seedType.run('monitor', '站点监控', 'normal', 20);
+    seedType.run('cron', '定时播报', 'normal', 30);
+    seedType.run('hermes', 'Hermes', 'normal', 40);
+    seedType.run('admin', '管理后台', 'normal', 50);
     notificationsDb = db;
   } catch (e) {
     console.warn('[admin-server] notifications.db 打开失败，通知中心停用:', e.message);
@@ -1213,17 +1245,44 @@ function openNotificationsDb() {
 }
 
 // 库内行 → 接口契约 item（字段名严格固定；dedup_key 不外泄）
+// type 为类别维度（可历史缺失，回退 source），source 字段保留不变，既有客户端不受影响。
 function notificationView(row) {
   return {
     id: Number(row.id),
     ts: Number(row.ts),
     level: row.level,
     source: row.source,
+    type: row.type || row.source,
     title: row.title,
     body: row.body,
     link: row.link,
     readAt: row.read_at == null ? null : Number(row.read_at)
   };
+}
+
+// 未注册类别自动注册：key 当 label、enabled=1。任何新写入方第一次发通知就自动出现在筛选器里。
+// 失败只 warn，绝不阻断写入（注册表出问题也不能丢通知）。
+function ensureNotificationType(db, key) {
+  if (!key) return;
+  try {
+    db.prepare(
+      'INSERT OR IGNORE INTO notification_types (key, label, description, default_level, sort, enabled, archived_at) ' +
+        'VALUES (?, ?, NULL, NULL, 0, 1, NULL)'
+    ).run(key, key);
+  } catch (e) {
+    console.warn('[admin-server] 通知类别自动注册失败（不影响写入）:', e.message);
+  }
+}
+
+// 取类别默认级别：default_level 合法才用，否则 normal（写入方显式给级别时不走这里）。
+function notificationDefaultLevel(db, key) {
+  try {
+    const row = db.prepare('SELECT default_level FROM notification_types WHERE key = ?').get(key);
+    const lvl = row && row.default_level;
+    return NOTIFICATION_LEVELS.has(lvl) ? lvl : 'normal';
+  } catch (e) {
+    return 'normal';
+  }
 }
 
 // 清理 30 天前的通知。启动时一次 + 每小时一次；失败只 warn，不影响其它接口。
@@ -1803,19 +1862,24 @@ app.get('/api/admin/system/stream', authRequired, (req, res) => {
 /* ============ 通知中心 · REST / SSE 路由 ============ */
 
 // 写入通知（本机脚本免 SSO；其余来源走 authRequired）。
-// body: { level, source, title, body?, link?, dedupKey? } → 201 { id, ts }
+// body: { level?, type?, source, title, body?, link?, dedupKey? } → 201 { id, ts }
+// - type 可选；缺省用 source 当类别键（兼容既有写入方）。
+// - type 未注册 → 自动注册（key 当 label、enabled=1）；enabled=0 的类别仍接受写入。
+// - level 缺省 → 用该类别的 default_level，再没有则 normal。
 app.post('/api/admin/notifications', notificationsWriteAuth, (req, res) => {
   const db = openNotificationsDb();
   if (!db) return res.status(503).json({ error: '通知库暂不可用' });
   const ip = clientIp(req);
   const b = req.body || {};
-  const level = typeof b.level === 'string' ? b.level.trim() : '';
+  const levelInput = typeof b.level === 'string' ? b.level.trim() : '';
   const source = typeof b.source === 'string' ? b.source.trim() : '';
+  const typeInput = typeof b.type === 'string' ? b.type.trim() : '';
+  const typeKey = typeInput || source; // 缺省用 source 兼容既有写入方
   const title = typeof b.title === 'string' ? b.title.trim() : '';
   const body = typeof b.body === 'string' && b.body !== '' ? b.body : null;
   const link = typeof b.link === 'string' && b.link !== '' ? b.link : null;
   const dedupKey = typeof b.dedupKey === 'string' && b.dedupKey !== '' ? b.dedupKey : null;
-  if (!NOTIFICATION_LEVELS.has(level)) {
+  if (levelInput && !NOTIFICATION_LEVELS.has(levelInput)) {
     return res.status(400).json({ error: 'level 必须是 urgent / normal / digest' });
   }
   if (!source || !title) {
@@ -1823,6 +1887,9 @@ app.post('/api/admin/notifications', notificationsWriteAuth, (req, res) => {
   }
   const now = Math.floor(Date.now() / 1000);
   try {
+    // 未注册类别自动注册；已注册（含 enabled=0）不动，照常接受写入
+    ensureNotificationType(db, typeKey);
+    const level = levelInput || notificationDefaultLevel(db, typeKey);
     if (dedupKey) {
       // 同一 dedupKey 10 分钟内只保留一条：更新 ts 与内容，不新增；重新置为未读
       const existing = db
@@ -1832,25 +1899,30 @@ app.post('/api/admin/notifications', notificationsWriteAuth, (req, res) => {
         .get(dedupKey, now - NOTIFICATIONS_DEDUP_WINDOW_SECONDS);
       if (existing) {
         db.prepare(
-          'UPDATE notifications SET ts=?, level=?, source=?, title=?, body=?, link=?, read_at=NULL WHERE id=?'
-        ).run(now, level, source, title, body, link, existing.id);
+          'UPDATE notifications SET ts=?, level=?, source=?, type=?, title=?, body=?, link=?, read_at=NULL WHERE id=?'
+        ).run(now, level, source, typeKey, title, body, link, existing.id);
         const item = notificationView(
           db.prepare('SELECT * FROM notifications WHERE id = ?').get(existing.id)
         );
         broadcastNotification(item);
-        auditLog('notification_write', ip, true, `dedup id=${existing.id} level=${level} source=${source}`);
+        auditLog(
+          'notification_write',
+          ip,
+          true,
+          `dedup id=${existing.id} level=${level} source=${source} type=${typeKey}`
+        );
         return res.status(201).json({ id: Number(existing.id), ts: now });
       }
     }
     const info = db
       .prepare(
-        'INSERT INTO notifications (ts, level, source, title, body, link, dedup_key, read_at) VALUES (?, ?, ?, ?, ?, ?, ?, NULL)'
+        'INSERT INTO notifications (ts, level, source, type, title, body, link, dedup_key, read_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)'
       )
-      .run(now, level, source, title, body, link, dedupKey);
+      .run(now, level, source, typeKey, title, body, link, dedupKey);
     const id = Number(info.lastInsertRowid);
     const item = notificationView(db.prepare('SELECT * FROM notifications WHERE id = ?').get(id));
     broadcastNotification(item);
-    auditLog('notification_write', ip, true, `id=${id} level=${level} source=${source}`);
+    auditLog('notification_write', ip, true, `id=${id} level=${level} source=${source} type=${typeKey}`);
     return res.status(201).json({ id, ts: now });
   } catch (e) {
     auditLog('notification_write', ip, false, e.message);
@@ -1858,7 +1930,8 @@ app.post('/api/admin/notifications', notificationsWriteAuth, (req, res) => {
   }
 });
 
-// 列表（需鉴权）：支持 limit / before / level / source / unread；unread 与 total 为全库计数
+// 列表（需鉴权）：支持 limit / before / level / source / type / unread；unread 与 total 为全库计数
+// type 为类别维度（命中该类别下全部通知），与 source 并存、互不替代。
 app.get('/api/admin/notifications', authRequired, (req, res) => {
   const db = openNotificationsDb();
   if (!db) return res.status(503).json({ error: '通知库暂不可用' });
@@ -1872,6 +1945,7 @@ app.get('/api/admin/notifications', authRequired, (req, res) => {
       : null;
     const source =
       req.query.source && String(req.query.source).trim() ? String(req.query.source).trim() : null;
+    const type = req.query.type && String(req.query.type).trim() ? String(req.query.type).trim() : null;
     const unreadOnly = String(req.query.unread || '') === '1';
 
     const where = [];
@@ -1883,6 +1957,10 @@ app.get('/api/admin/notifications', authRequired, (req, res) => {
     if (source) {
       where.push('source = ?');
       args.push(source);
+    }
+    if (type) {
+      where.push('type = ?');
+      args.push(type);
     }
     if (before != null) {
       where.push('id < ?');
@@ -1902,6 +1980,89 @@ app.get('/api/admin/notifications', authRequired, (req, res) => {
     res.json({ items, unread, total });
   } catch (e) {
     res.status(500).json({ error: '获取通知失败' });
+  }
+});
+
+// 通知类别列表（需鉴权）：类别由服务端定义，客户端据此动态渲染筛选器（不得内置清单）。
+// 返回 count/unread 为当前库内统计（仅供参考）；按 sort、label 排序；软删（archived_at）的不返回。
+app.get('/api/admin/notifications/types', authRequired, (req, res) => {
+  const db = openNotificationsDb();
+  if (!db) return res.status(503).json({ error: '通知库暂不可用' });
+  try {
+    const rows = db
+      .prepare(
+        'SELECT t.key, t.label, t.description, t.default_level, t.sort, t.enabled, ' +
+          '(SELECT COUNT(*) FROM notifications n WHERE n.type = t.key) AS count, ' +
+          '(SELECT COUNT(*) FROM notifications n WHERE n.type = t.key AND n.read_at IS NULL) AS unread ' +
+          'FROM notification_types t WHERE t.archived_at IS NULL ' +
+          'ORDER BY t.sort ASC, t.label ASC'
+      )
+      .all();
+    const types = rows.map((r) => ({
+      key: r.key,
+      label: r.label,
+      description: r.description,
+      defaultLevel: r.default_level,
+      sort: Number(r.sort) || 0,
+      enabled: Number(r.enabled) === 1 ? 1 : 0,
+      count: Number(r.count) || 0,
+      unread: Number(r.unread) || 0
+    }));
+    res.json({ types });
+  } catch (e) {
+    res.status(500).json({ error: '获取通知类别失败' });
+  }
+});
+
+// 修改通知类别（需鉴权）：body { label?, description?, defaultLevel?, sort?, enabled? } → { ok: true }
+// 表即配置；只有传入的字段被更新，未传字段保持原值。
+app.patch('/api/admin/notifications/types/:key', authRequired, (req, res) => {
+  const db = openNotificationsDb();
+  if (!db) return res.status(503).json({ error: '通知库暂不可用' });
+  const key = String(req.params.key || '').trim();
+  if (!key) return res.status(400).json({ error: '无效的类别' });
+  const b = req.body || {};
+  const sets = [];
+  const args = [];
+  if (typeof b.label === 'string') {
+    const label = b.label.trim();
+    if (!label) return res.status(400).json({ error: 'label 不能为空' });
+    sets.push('label = ?');
+    args.push(label);
+  }
+  if (typeof b.description === 'string') {
+    sets.push('description = ?');
+    args.push(b.description);
+  }
+  if (typeof b.defaultLevel === 'string') {
+    const dl = b.defaultLevel.trim();
+    if (dl && !NOTIFICATION_LEVELS.has(dl)) {
+      return res.status(400).json({ error: 'defaultLevel 必须是 urgent / normal / digest' });
+    }
+    sets.push('default_level = ?');
+    args.push(dl || null);
+  }
+  if (b.sort !== undefined && b.sort !== null && b.sort !== '') {
+    const s = parseInt(b.sort, 10);
+    if (!Number.isFinite(s)) return res.status(400).json({ error: 'sort 必须是整数' });
+    sets.push('sort = ?');
+    args.push(s);
+  }
+  if (b.enabled !== undefined && b.enabled !== null) {
+    const en = b.enabled === true || b.enabled === 1 || b.enabled === '1' ? 1 : 0;
+    sets.push('enabled = ?');
+    args.push(en);
+  }
+  if (!sets.length) return res.status(400).json({ error: '没有可修改的字段' });
+  try {
+    const info = db
+      .prepare('UPDATE notification_types SET ' + sets.join(', ') + ' WHERE key = ?')
+      .run(...args, key);
+    if (Number(info.changes) === 0) return res.status(404).json({ error: '类别不存在' });
+    auditLog('notification_type_update', clientIp(req), true, `key=${key} fields=${sets.length}`);
+    res.json({ ok: true });
+  } catch (e) {
+    return res.status(500).json({ error: '修改通知类别失败' });
   }
 });
 
