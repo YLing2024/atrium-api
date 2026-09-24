@@ -1375,7 +1375,8 @@ const SERVICE_CHECKS = [
   { name: 'nginx', port: 80 },
   { name: 'redis', port: 6379 },
   { name: 'blog', port: 4000 },
-  { name: 'admin-test', port: 3101 }
+  { name: 'admin-test', port: 3101 },
+  { name: 'aionui', port: 3010 }
 ];
 
 // 尝试 TCP 连接目标端口，connect 成功即视为 up
@@ -2443,7 +2444,8 @@ const SYSTEMD_SERVICES = [
   'nginx',
   'redis-server',
   'hermes-gateway',
-  'hermes-serve'
+  'hermes-serve',
+  'aionui-web'
 ];
 
 // 模块级进程瞬时 CPU 采样状态：pid -> { cpu, total }（上次 /proc 采样值，单位 clock ticks）
@@ -2598,6 +2600,10 @@ async function collectProcesses() {
           // pi coding agent（@earendil-works/pi-coding-agent）：启动后会把进程标题改写成纯 "pi"，
           // 故优先按 comm 判定；另保留包名/裸命令两种兜底形态
           name = 'pi';
+        } else if (comm === 'aioncore' || args.includes('aioncore') || args.includes('aionui-src')) {
+          // AionUi WebUI：主进程是 bun 包装器 + node(tsx/cross-env) + aioncore 后端 + esbuild 子进程，
+          // 不归类的话在榜单里会被拆成一堆无名 node/aioncore，看不出是同一个项目
+          name = 'aionui';
         } else if (comm === 'node' || args.includes('node')) {
           name = 'node';
         } else if (/^python/.test(comm)) {
