@@ -27,9 +27,12 @@ const UPLOAD_DIR = process.env.ADMIN_UPLOAD_DIR || path.join(__dirname, '..', 'u
 // 文件区：admin「文件」Tab 的上传落点。独立于 uploads/，专用于把文件传给 Hermes（保留原始文件名）
 const FILE_DIR = process.env.ADMIN_FILE_DIR || '/root/files/download';
 const FILE_MAX_BYTES = 500 * 1024 * 1024; // 单文件上限 500MB（与 /api/admin/upload 的 100MB 相互独立）
-// 文件区根目录这一层的保护名单：正在使用的 swap 文件与 ext4 的 lost+found，不可见也不可被写操作命中。
-// 只保护根目录这一层，子目录中的同名文件（如 <root>/backup/swapfile）不受影响。
+// 文件区根目录这一层的保护名单，分两类：
+//  · FILE_ROOT_PROTECTED —— 系统文件，不展示、也不允许任何写操作命中其整棵子树（swapfile / lost+found / cache）
+//  · FILE_ROOT_READONLY  —— 收纳目录，正常展示、可浏览，但「根这一层的那一项」不允许被删/改名/移动，子路径照常读写
+// 两者都只作用于根目录这一层：子目录中的同名文件（如 <root>/backup/swapfile）不受影响。
 const FILE_ROOT_PROTECTED = new Set(['swapfile', 'lost+found', 'cache']);
+const FILE_ROOT_READONLY = new Set(['toolchains', 'apps', 'build', 'www', 'files', 'backups']);
 try {
   fs.mkdirSync(FILE_DIR, { recursive: true });
 } catch (e) {
@@ -2708,8 +2711,17 @@ function isProtectedPath(full) {
   if (full === FILE_DIR) return false;
   const rel = path.relative(FILE_DIR, full);
   if (!rel || rel === '..' || rel.startsWith('..' + path.sep) || path.isAbsolute(rel)) return false;
-  const top = rel.split(path.sep)[0];
-  return FILE_ROOT_PROTECTED.has(top);
+  const parts = rel.split(path.sep);
+  if (FILE_ROOT_PROTECTED.has(parts[0])) return true; // 整棵子树都不可写
+  return parts.length === 1 && FILE_ROOT_READONLY.has(parts[0]); // 只挡根这一层那一项
+}
+
+// 是否属于「连列表里都不展示」的那一类：只用于列目录过滤，不参与写操作判定
+function isHiddenRootPath(full) {
+  if (full === FILE_DIR) return false;
+  const rel = path.relative(FILE_DIR, full);
+  if (!rel || rel === '..' || rel.startsWith('..' + path.sep) || path.isAbsolute(rel)) return false;
+  return FILE_ROOT_PROTECTED.has(rel.split(path.sep)[0]);
 }
 
 // 绝对路径 → 相对 FILE_DIR 的路径（用 / 分隔）；根目录为 ''
@@ -2791,8 +2803,8 @@ app.get('/api/admin/files', authRequired, (req, res) => {
         const isDir = s.isDirectory();
         // 跳过符号链接与特殊文件（防逃逸）
         if (!isDir && !s.isFile()) return null;
-        // 根目录保护名单（swapfile / lost+found）不展示
-        if (isProtectedPath(path.join(dir, d.name))) return null;
+        // 根目录保护名单（swapfile / lost+found / cache）不展示
+        if (isHiddenRootPath(path.join(dir, d.name))) return null;
         return {
           name: d.name,
           type: isDir ? 'dir' : 'file',
