@@ -178,39 +178,16 @@ const AUTH_CENTER_VERIFY_URL =
   process.env.AUTH_CENTER_VERIFY_URL || 'http://127.0.0.1:3200/api/verify';
 
 // 鉴权中间件：
-//  主鉴权 —— 信任 Nginx 探针注入的 X-Auth-User header（认证中心已验证，内网可信），
-//  存在且非空即通过，req.user 设为其值；
-//  降级 —— header 缺失时回退旧 Redis 会话校验（过渡期兼容，支持 Bearer 与 query token）
+//   用户身份只认 Auth Gateway 注入的请求头 `X-Auth-User`（网关会先剥掉客户端伪造的同名头）。
+//   存在且非空 → 通过并把 req.user 设为其值；缺失/为空 → 401（不 302、不 500）。
+//   兼容旧客户端/自动化脚本所需的本地会话与接口令牌已不再作为本中间件的凭证来源。
 async function authRequired(req, res, next) {
   const xAuthUser = req.get('x-auth-user');
   if (xAuthUser && String(xAuthUser).trim()) {
-    req.user = { role: 'admin', name: String(xAuthUser).trim() };
+    req.user = { role: 'admin', name: String(xAuthUser).trim(), via: 'gateway' };
     return next();
   }
-  const header = req.headers.authorization || '';
-  const headerToken = header.startsWith('Bearer ') ? header.slice(7).trim() : null;
-  const queryToken = req.query && req.query.token ? String(req.query.token) : null;
-  const token = headerToken || queryToken;
-  if (!token) {
-    return res.status(401).json({ error: '未登录' });
-  }
-  try {
-    const stored = await redis.get(sessionKey(token));
-    if (!stored || stored !== token) {
-      // Redis 会话校验未通过：回退查接口令牌（固定过期、不滑动续期，直连场景也可用）
-      // 与 notificationsWriteAuth 共用 lookupApiTokenMeta，避免两处比对逻辑漂移
-      const meta = await lookupApiTokenMeta(token);
-      if (!meta) return res.status(401).json({ error: '未登录或会话已过期' });
-      // canWrite 为令牌元数据新增字段：缺省（老令牌）视为只读，绝不放宽已有令牌权限
-      req.user = { role: 'admin', name: meta.name, via: 'api-token', canWrite: meta.canWrite === true };
-      return next();
-    }
-    await redis.expire(sessionKey(token), SESSION_TTL); // 滑动续期
-    req.user = { role: 'admin' };
-    next();
-  } catch (e) {
-    return res.status(500).json({ error: '会话服务异常' });
-  }
+  return res.status(401).json({ error: '未登录' });
 }
 
 /* ============ 系统信息采集 ============ */
@@ -1333,7 +1310,8 @@ function isDirectLoopback(req) {
   return true;
 }
 
-// 从请求中提取 API 令牌明文：Authorization: Bearer 优先，兼容 X-Quotahub-Token 与 ?token=（与 authRequired 降级分支一致）
+// 从请求中提取 API 令牌明文：Authorization: Bearer 优先，兼容 X-Quotahub-Token 与 ?token=
+// （仅用于通知写入等独立令牌通道；/api/admin/* 主鉴权只认网关注入的 X-Auth-User）
 function requestApiToken(req) {
   const header = req.headers.authorization || '';
   if (header.startsWith('Bearer ')) {
@@ -1348,7 +1326,7 @@ function requestApiToken(req) {
 
 async function notificationsWriteAuth(req, res, next) {
   if (isDirectLoopback(req)) return next();
-  // 显式识别「本次请求是否用 API Token」：经 nginx 的请求带 X-Auth-User，authRequired 会走
+  // 显式识别「本次请求是否用 API Token」：经网关的请求带 X-Auth-User，authRequired 会走
   // 「信任头部」路径、req.user 无 via/canWrite，只读令牌会绕过闸门，故这里独立查令牌表。
   const token = requestApiToken(req);
   if (token) {
@@ -1505,8 +1483,8 @@ app.post('/api/admin/login', async (req, res) => {
   }
 });
 
-// SSO 验证（无鉴权，保留兼容：认证中心签发 token → 建立本地 Redis 会话）。
-// 新前端不再调用（直接信任认证中心 token），此处仅服务过渡期/旧客户端。
+// SSO 验证（无鉴权，仅兼容旧客户端保留；**已废弃**：2026-09-28 起登录由 Auth Gateway 负责）。
+// 新前端不再调用；本端点签发的本地 Redis 会话也不再被 authRequired 接受（主鉴权只认 X-Auth-User）。
 app.post('/api/admin/sso/verify', async (req, res) => {
   const { token } = req.body || {};
   const ip = clientIp(req);
