@@ -16,7 +16,7 @@
 - **Hermes 历史会话只读浏览**（直接读 `~/.hermes/state.db`）
 - **Web 终端**：口令二次验证 + 票据签发 + ttyd 会话管理
 
-监听 `127.0.0.1:3100`（systemd `admin-server.service`），由 nginx 反代并做 SSO 探针鉴权。
+监听 `127.0.0.1:3100`（systemd `admin-server.service`），由 nginx 交给 Auth Gateway（`127.0.0.1:18920`）鉴权后反代进来。
 
 ## 技术栈
 
@@ -29,7 +29,7 @@
 
 ```
 src/
-├── index.js    # 全部路由 + 采样器 + 探针中间件（单文件，1600+ 行）
+├── index.js    # 全部路由 + 采样器 + 鉴权中间件（单文件，1600+ 行）
 └── config.js   # config.json 读写（首次运行自动生成，含初始密码）
 config.json         # 本地生成，不入库（.gitignore）
 uploads/            # 上传目录，不入库
@@ -51,7 +51,7 @@ npm start        # = node src/index.js，监听 3100
 | 方法 | 路径 | 鉴权 | 说明 |
 |---|---|---|---|
 | POST | `/api/admin/login` | 无 | TOTP 登录（过渡期保留） |
-| POST | `/api/admin/sso/verify` | 无 | 旧客户端兼容，新前端不再调用 |
+| POST | `/api/admin/sso/verify` | 无 | **已废弃**（旧客户端兼容保留；主流程不再使用） |
 | GET | `/api/admin/system` | ✅ | 系统信息快照 |
 | GET | `/api/admin/system/history` | ✅ | 历史采样 |
 | GET | `/api/admin/system/stream` | ✅ | SSE 实时推送 |
@@ -75,9 +75,10 @@ npm start        # = node src/index.js，监听 3100
 
 ## 鉴权模型
 
-1. **主路径**：nginx `auth_request /auth-check` → 认证中心 `127.0.0.1:3200/api/verify` → 通过后注入 `X-Auth-User` 头 → 本服务 `authRequired` 信任该 header。
-2. **降级**（过渡期）：`X-Auth-User` 缺失时回退 Redis 会话校验（`Authorization: Bearer` 或 `?token=`，key 前缀 `admin:session:`，12h 滑动续期）。
-3. 客户端 IP 一律用 `clientIp()` 读 **`X-Real-IP`**（`req.ip` 恒为 127.0.0.1 会导致限流退化成全局桶、审计日志丢真实 IP）。
+1. **主路径（唯一）**：登录 / OAuth2 / state+PKCE / 会话全部由 **Auth Gateway**（`127.0.0.1:18920`，nginx 反代进来）负责。网关注入请求头 `X-Auth-User`，本服务 `authRequired` 只读该头：存在且非空 → 通过；缺失/为空 → `401 {error:'未登录'}`（不 302、不 500）。nginx 里**不再有** `auth_request` / `/auth-check` / `?token=`。
+2. **已废弃（仅旧客户端兼容保留，不再作为 `/api/admin/*` 凭证）**：Redis 会话（`admin:session:<token>`，12h 滑动）、接口令牌（`api:token:<sha256>`）、`POST /api/admin/sso/verify`。TOTP 端点（`/api/admin/login`、`/api/admin/totp/*`）保留不动，但不再由前端引导使用。
+3. 例外：通知写入（`notificationsWriteAuth`）仍接受「回环直连」与可写 API Token（`canWrite===true`），这是独立通道，不在本次改动范围。
+4. 客户端 IP 一律用 `clientIp()` 读 **`X-Real-IP`**（`req.ip` 恒为 127.0.0.1 会导致限流退化成全局桶、审计日志丢真实 IP）。
 
 ## 环境变量
 
@@ -89,7 +90,8 @@ npm start        # = node src/index.js，监听 3100
 | `ADMIN_FILE_DIR` | `/root/files/download` | 文件区根目录（admin「文件」Tab；所有路径严格限制在其内） |
 | `ADMIN_AUDIT_LOG` | `../audit.log` | 审计日志 |
 | `HERMES_STATE_DB` | `~/.hermes/state.db` | 历史浏览数据源（测试用可覆盖隔离） |
-| `AUTH_CENTER_BASE_URL` / `AUTH_CENTER_VERIFY_URL` | 认证中心 | 转发与探针地址 |
+| `AUTH_CENTER_BASE_URL` | 认证中心 | 转发设备会话管理 `/api/admin/sessions*` 用 |
+| `AUTH_CENTER_VERIFY_URL` | 认证中心 | 仅**已废弃**的 `/api/admin/sso/verify` 旧客户端通道使用 |
 | `ADMIN_REDIS_PREFIX` | 见代码 | Redis key 前缀（测试实例隔离） |
 | `ADMIN_TERM_PW_FILE` | `/root/.hermes/term_password` | 终端口令哈希文件（`sha256$<salt>$<hash>`，600） |
 
@@ -104,10 +106,10 @@ npm start        # = node src/index.js，监听 3100
 ## 已知坑
 
 - **单文件大块头**：所有路由都在 `src/index.js`。改动时按注释分区定位，别整体重排（会产生巨大 diff）。
-- 🔴 **nginx 侧有两条与大文件上传相关的硬约束**（2026-09-14 踩坑，改配置前必读）：
+- 🔴 **nginx 侧与大文件上传相关的硬约束**（2026-09-14 踩坑，改配置前必读）：
   1. `/api/admin/` 的 `client_max_body_size` 是 **100m**，文件区上传走的是单独加的 `location /api/admin/files/upload`（**512m**）。新增任何接收大 body 的接口，都要确认它落在哪个 location、那个 location 的上限是多少——**nginx 先于应用层拒绝，返回的是 HTML 而不是 JSON**。
-  2. **`/auth-check` 探针 location 必须显式写 `client_max_body_size 0;`**。SSO 探针是个子请求，它**不会**继承父 location 的上限，而是用全局默认 **1m**——不写这行，任何 >1MB 的上传都会在鉴权阶段被 413 掉（表现为 500 + `auth request unexpected status: 413`）。
-  3. 别在该 location 上加 `proxy_request_buffering off;`：`auth_request` 要求请求体先缓冲，关掉后**连 5MB 都传不上去**（会 500）。
+  2. ~~`/auth-check` 探针 location 必须显式写 `client_max_body_size 0;`~~ —— **探针已废弃（2026-09-28 改由 Auth Gateway 鉴权），本坑不再适用**。网关自行处理请求体，不再有「子请求不继承父 location 上限」的问题。
+  3. ~~别在探针 location 上加 `proxy_request_buffering off;`~~ —— 同上，`auth_request` 子请求机制已不存在，本坑不再适用。
 - 历史浏览用 **`node:sqlite` 只读打开**，不要改成可写或长连接持有（Hermes 网关正在写同一个库）。
 - 采样器有 Redis/文件锁（`ADMIN_SAMPLER_LOCK`）防多实例重复采样；测试实例务必改锁与前缀，否则会和线上互相干扰。
 - 无热重载：改完必须重启进程才生效。
@@ -121,7 +123,7 @@ systemctl status admin-server
 journalctl -u admin-server -n 100 --no-pager
 ```
 
-nginx 层：`/api/admin/*` → `127.0.0.1:3100`；免鉴权白名单 `login|sso/verify|totp/setup|totp/reset`；其余走探针。
+nginx 层：`/api/admin/*` → Auth Gateway（`127.0.0.1:18920`）鉴权后反代 `127.0.0.1:3100`；网关登录/回调/登出/me 走 `/_auth/`。配置里不再有 `auth_request` / `/auth-check` / `?token=`。
 
 ## 项目记忆（PROJECT_MEMORY.md）
 

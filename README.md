@@ -6,18 +6,20 @@
 
 - REST：`/api/admin/system`、`/api/admin/system/history`、`/api/admin/services`、`/api/admin/versions`、`/api/admin/upload`、`/api/admin/download`、`/api/admin/password`
 - 历史浏览（只读）：`/api/admin/history`（会话列表）、`/api/admin/history/:id`（会话消息），数据源为 Hermes `~/.hermes/state.db`（`node:sqlite` 只读打开，请求内 open→query→close）
-- 登录：TOTP 动态码（`/api/admin/login`，过渡期保留）+ 统一 SSO（认证中心）
+- 登录：登录 / TOTP / SSO 全部由 Auth Gateway 负责；本服务只读网关注入的 `X-Auth-User`。TOTP 端点（`/api/admin/login` 等）保留但不再由前端引导使用
 
-## SSO 接入架构（Nginx 探针 + auth_token）
+## 鉴权接入架构（Auth Gateway）
 
-1. 用户在认证中心（auth-server，3200）完成 TOTP 登录，token 回跳给前端；
-2. 前端把 token 存 `localStorage.auth_token`，所有 REST 请求带 `Authorization: Bearer ***
-3. **REST 鉴权由 Nginx `auth_request` 探针完成**：`/auth-check` 转发到 `http://127.0.0.1:3200/api/verify`，验证通过后注入 `X-Auth-User` 头 → admin-server 信任该 header。
+1. 用户在 Auth Gateway（Go 单二进制，`127.0.0.1:18920`，nginx 反代进来）完成登录（TOTP 在认证中心）；会话由网关的站点 cookie 持有。
+2. 浏览器请求 `/api/admin/*`：nginx 交给网关，网关鉴权通过后**注入 `X-Auth-User` 头**再反代到 admin-server。
+3. admin-server 的 `authRequired` **只读该头**：存在且非空 → 通过；缺失/为空 → `401 {error:'未登录'}`。
+4. 前端不再存 token、不再需要认证中心地址。
 
-### 鉴权降级（过渡期）
+### 已废弃（仅旧客户端兼容保留）
 
-- REST：`X-Auth-User` 缺失时回退旧 **Redis 会话**校验（`Authorization: *** 或 `?token=`，key 前缀 `admin:session:`，12h 滑动续期）；
-- `POST /api/admin/sso/verify` 保留（兼容旧客户端，新前端已不再调用）。
+- Redis 会话（`admin:session:<token>`）与接口令牌（`api:token:<sha256>`）**不再是 `/api/admin/*` 的凭证**；
+- `POST /api/admin/sso/verify` 与 nginx `auth_request /auth-check` 探针已废弃；
+- 通知写入（`notificationsWriteAuth`）仍接受回环直连与可写 API Token，是独立通道。
 
 ## 运行
 
