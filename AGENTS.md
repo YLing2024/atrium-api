@@ -67,6 +67,8 @@ npm start        # = node src/index.js，监听 3100
 | POST | `/api/admin/password` | ✅ | 修改密码（≥8 位），同步写回 config.json |
 | GET | `/api/admin/history[/:id]` | ✅ | Hermes 会话只读浏览 |
 | `*` | `/api/admin/sessions*` | ✅ | 身份取 `X-Auth-User`，用 `X-Internal-Token` 转发认证中心内部接口 `/api/internal/sessions*` |
+| POST | `/api/admin/totp/reset` | ✅ | TOTP 两阶段重置①：取 `X-Auth-User`，用 `X-Internal-Token` 调 `/api/internal/totp/reset?sub=`（不转发客户端凭证） |
+| POST | `/api/admin/totp/confirm` | ✅ | TOTP 两阶段重置②：body `{code}`，同上调 `/api/internal/totp/confirm?sub=` |
 | GET/POST/DELETE | `/api/admin/api-tokens` | ✅ | 接口令牌管理 |
 | POST | `/api/admin/term/unlock` | ✅ | 校验终端口令 → 下发 12h 票据 |
 | GET | `/api/admin/term/verify` | 仅本机 | ttyd wrapper 校验票据（127.0.0.1） |
@@ -75,8 +77,8 @@ npm start        # = node src/index.js，监听 3100
 ## 鉴权模型
 
 1. **主路径（唯一）**：登录 / OAuth2 / state+PKCE / 会话全部由 **Auth Gateway**（`127.0.0.1:18920`，nginx 反代进来）负责。网关注入请求头 `X-Auth-User`，本服务 `authRequired` 只读该头：存在且非空 → 通过；缺失/为空 → `401 {error:'未登录'}`（不 302、不 500）。nginx 里**不再有** `auth_request` / `/auth-check` / `?token=`。
-2. **已废弃（仅旧客户端兼容保留，不再作为 `/api/admin/*` 凭证）**：Redis 会话（`admin:session:<token>`，12h 滑动）、接口令牌（`api:token:<sha256>`）。TOTP 端点（`/api/admin/login`、`/api/admin/totp/*`）保留不动，但不再由前端引导使用。`POST /api/admin/sso/verify` 与 `AUTH_CENTER_VERIFY_URL` 已**删除**（2026-09-29）。
-3. 设备会话（`/api/admin/sessions*`）**不再转发任何客户端凭证**：身份取 `X-Auth-User`，用共享内部令牌 `X-Internal-Token` 调认证中心内部接口 `/api/internal/sessions*`；令牌文件只读，绝不出现在日志/响应/审计里。
+2. **已废弃（仅旧客户端兼容保留，不再作为 `/api/admin/*` 凭证）**：Redis 会话（`admin:session:<token>`，12h 滑动）、接口令牌（`api:token:<sha256>`）。TOTP 端点 `/api/admin/login` 保留不动，但不再由前端引导使用；`/api/admin/totp/*` 已改为内部转发（见下）。`POST /api/admin/sso/verify` 与 `AUTH_CENTER_VERIFY_URL` 已**删除**（2026-09-29）。
+3. 设备会话（`/api/admin/sessions*`）与 TOTP 重置（`/api/admin/totp/*`）**不再转发任何客户端凭证**：身份取 `X-Auth-User`，用共享内部令牌 `X-Internal-Token` 调认证中心内部接口（`/api/internal/sessions*`、`/api/internal/totp/*?sub=`）；令牌文件只读，绝不出现在日志/响应/审计里。TOTP 两阶段语义（reset 只写 pending → confirm 验证转正）由认证中心内部实现，本服务仅透传。
 4. 例外：通知写入（`notificationsWriteAuth`）仍接受「回环直连」与可写 API Token（`canWrite===true`），这是独立通道，不在本次改动范围。
 5. 客户端 IP 一律用 `clientIp()` 读 **`X-Real-IP`**（`req.ip` 恒为 127.0.0.1 会导致限流退化成全局桶、审计日志丢真实 IP）。
 

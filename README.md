@@ -6,7 +6,7 @@
 
 - REST：`/api/admin/system`、`/api/admin/system/history`、`/api/admin/services`、`/api/admin/versions`、`/api/admin/upload`、`/api/admin/download`、`/api/admin/password`
 - 历史浏览（只读）：`/api/admin/history`（会话列表）、`/api/admin/history/:id`（会话消息），数据源为 Hermes `~/.hermes/state.db`（`node:sqlite` 只读打开，请求内 open→query→close）
-- 登录：登录 / TOTP / SSO 全部由 Auth Gateway 负责；本服务只读网关注入的 `X-Auth-User`。TOTP 端点（`/api/admin/login` 等）保留但不再由前端引导使用
+- 登录：登录 / TOTP / SSO 全部由 Auth Gateway 负责；本服务只读网关注入的 `X-Auth-User`。`/api/admin/login` 保留但不再由前端引导使用；`/api/admin/totp/reset|confirm` 取 `X-Auth-User` 后经内部令牌调认证中心 `/api/internal/totp/*`
 
 ## 鉴权接入架构（Auth Gateway）
 
@@ -19,7 +19,7 @@
 
 - Redis 会话（`admin:session:<token>`）与接口令牌（`api:token:<sha256>`）**不再是 `/api/admin/*` 的凭证**；
 - `POST /api/admin/sso/verify` 与 `AUTH_CENTER_VERIFY_URL` 已删除，nginx `auth_request /auth-check` 探针已废弃；
-- 设备会话 `/api/admin/sessions*` 只认 `X-Auth-User`，经内部令牌调认证中心 `/api/internal/sessions*`，不再转发客户端凭证；
+- 设备会话 `/api/admin/sessions*` 与 TOTP 重置 `/api/admin/totp/*` 只认 `X-Auth-User`，经内部令牌调认证中心 `/api/internal/sessions*`、`/api/internal/totp/*?sub=`，不再转发客户端凭证；
 - 通知写入（`notificationsWriteAuth`）仍接受回环直连与可写 API Token，是独立通道。
 
 ## 运行
