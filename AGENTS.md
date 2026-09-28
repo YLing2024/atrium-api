@@ -51,7 +51,6 @@ npm start        # = node src/index.js，监听 3100
 | 方法 | 路径 | 鉴权 | 说明 |
 |---|---|---|---|
 | POST | `/api/admin/login` | 无 | TOTP 登录（过渡期保留） |
-| POST | `/api/admin/sso/verify` | 无 | **已废弃**（旧客户端兼容保留；主流程不再使用） |
 | GET | `/api/admin/system` | ✅ | 系统信息快照 |
 | GET | `/api/admin/system/history` | ✅ | 历史采样 |
 | GET | `/api/admin/system/stream` | ✅ | SSE 实时推送 |
@@ -67,7 +66,7 @@ npm start        # = node src/index.js，监听 3100
 | DELETE | `/api/admin/files?path=` | ✅ | 删除文件或目录（目录递归） |
 | POST | `/api/admin/password` | ✅ | 修改密码（≥8 位），同步写回 config.json |
 | GET | `/api/admin/history[/:id]` | ✅ | Hermes 会话只读浏览 |
-| `*` | `/api/admin/sessions*` | ✅ | 转发认证中心 `/api/sessions` |
+| `*` | `/api/admin/sessions*` | ✅ | 身份取 `X-Auth-User`，用 `X-Internal-Token` 转发认证中心内部接口 `/api/internal/sessions*` |
 | GET/POST/DELETE | `/api/admin/api-tokens` | ✅ | 接口令牌管理 |
 | POST | `/api/admin/term/unlock` | ✅ | 校验终端口令 → 下发 12h 票据 |
 | GET | `/api/admin/term/verify` | 仅本机 | ttyd wrapper 校验票据（127.0.0.1） |
@@ -76,9 +75,10 @@ npm start        # = node src/index.js，监听 3100
 ## 鉴权模型
 
 1. **主路径（唯一）**：登录 / OAuth2 / state+PKCE / 会话全部由 **Auth Gateway**（`127.0.0.1:18920`，nginx 反代进来）负责。网关注入请求头 `X-Auth-User`，本服务 `authRequired` 只读该头：存在且非空 → 通过；缺失/为空 → `401 {error:'未登录'}`（不 302、不 500）。nginx 里**不再有** `auth_request` / `/auth-check` / `?token=`。
-2. **已废弃（仅旧客户端兼容保留，不再作为 `/api/admin/*` 凭证）**：Redis 会话（`admin:session:<token>`，12h 滑动）、接口令牌（`api:token:<sha256>`）、`POST /api/admin/sso/verify`。TOTP 端点（`/api/admin/login`、`/api/admin/totp/*`）保留不动，但不再由前端引导使用。
-3. 例外：通知写入（`notificationsWriteAuth`）仍接受「回环直连」与可写 API Token（`canWrite===true`），这是独立通道，不在本次改动范围。
-4. 客户端 IP 一律用 `clientIp()` 读 **`X-Real-IP`**（`req.ip` 恒为 127.0.0.1 会导致限流退化成全局桶、审计日志丢真实 IP）。
+2. **已废弃（仅旧客户端兼容保留，不再作为 `/api/admin/*` 凭证）**：Redis 会话（`admin:session:<token>`，12h 滑动）、接口令牌（`api:token:<sha256>`）。TOTP 端点（`/api/admin/login`、`/api/admin/totp/*`）保留不动，但不再由前端引导使用。`POST /api/admin/sso/verify` 与 `AUTH_CENTER_VERIFY_URL` 已**删除**（2026-09-29）。
+3. 设备会话（`/api/admin/sessions*`）**不再转发任何客户端凭证**：身份取 `X-Auth-User`，用共享内部令牌 `X-Internal-Token` 调认证中心内部接口 `/api/internal/sessions*`；令牌文件只读，绝不出现在日志/响应/审计里。
+4. 例外：通知写入（`notificationsWriteAuth`）仍接受「回环直连」与可写 API Token（`canWrite===true`），这是独立通道，不在本次改动范围。
+5. 客户端 IP 一律用 `clientIp()` 读 **`X-Real-IP`**（`req.ip` 恒为 127.0.0.1 会导致限流退化成全局桶、审计日志丢真实 IP）。
 
 ## 环境变量
 
@@ -90,8 +90,8 @@ npm start        # = node src/index.js，监听 3100
 | `ADMIN_FILE_DIR` | `/root/files/download` | 文件区根目录（admin「文件」Tab；所有路径严格限制在其内） |
 | `ADMIN_AUDIT_LOG` | `../audit.log` | 审计日志 |
 | `HERMES_STATE_DB` | `~/.hermes/state.db` | 历史浏览数据源（测试用可覆盖隔离） |
-| `AUTH_CENTER_BASE_URL` | 认证中心 | 转发设备会话管理 `/api/admin/sessions*` 用 |
-| `AUTH_CENTER_VERIFY_URL` | 认证中心 | 仅**已废弃**的 `/api/admin/sso/verify` 旧客户端通道使用 |
+| `AUTH_CENTER_BASE_URL` | 无默认 | 认证中心基址（转发设备会话 `/api/admin/sessions*` 与 `/api/admin/totp/*` 用）；未配置时相关接口返回 502 |
+| `AUTH_CENTER_INTERNAL_TOKEN_FILE` | `../../auth-server/internal-token` | 认证中心内部令牌文件（`X-Internal-Token`，0600）；只读、不打印、不返回 |
 | `ADMIN_REDIS_PREFIX` | 见代码 | Redis key 前缀（测试实例隔离） |
 | `ADMIN_TERM_PW_FILE` | `/root/.hermes/term_password` | 终端口令哈希文件（`sha256$<salt>$<hash>`，600） |
 

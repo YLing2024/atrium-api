@@ -18,7 +18,8 @@
 ### 已废弃（仅旧客户端兼容保留）
 
 - Redis 会话（`admin:session:<token>`）与接口令牌（`api:token:<sha256>`）**不再是 `/api/admin/*` 的凭证**；
-- `POST /api/admin/sso/verify` 与 nginx `auth_request /auth-check` 探针已废弃；
+- `POST /api/admin/sso/verify` 与 `AUTH_CENTER_VERIFY_URL` 已删除，nginx `auth_request /auth-check` 探针已废弃；
+- 设备会话 `/api/admin/sessions*` 只认 `X-Auth-User`，经内部令牌调认证中心 `/api/internal/sessions*`，不再转发客户端凭证；
 - 通知写入（`notificationsWriteAuth`）仍接受回环直连与可写 API Token，是独立通道。
 
 ## 运行

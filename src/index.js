@@ -173,10 +173,6 @@ const auth = createTotpAuth({
   rateLimit: { maxFailures: 5, lockout: [60, 300, 900] },
 });
 
-// 认证中心地址：SSO 兼容接口（/api/admin/sso/verify）校验用
-const AUTH_CENTER_VERIFY_URL =
-  process.env.AUTH_CENTER_VERIFY_URL || 'http://127.0.0.1:3200/api/verify';
-
 // 鉴权中间件：
 //   用户身份只认 Auth Gateway 注入的请求头 `X-Auth-User`（网关会先剥掉客户端伪造的同名头）。
 //   存在且非空 → 通过并把 req.user 设为其值；缺失/为空 → 401（不 302、不 500）。
