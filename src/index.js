@@ -1487,26 +1487,56 @@ function authCenterBaseUrl() {
   return configured ? String(configured).replace(/\/+$/, '') : '';
 }
 
-// TOTP 重置 / 确认：转发到认证中心（带 Authorization 透传，认证中心校验 Redis 会话），
-// 由认证中心执行标准两阶段重置（reset 生成 pending → confirm 验证转正）。
-// 注：这两个端点是 nginx 白名单保留的旧通道，认证中心侧仍走 requireSession，本次保留不动。
-function forwardTotp(path) {
+// 认证中心共享内部令牌（0600）：只读，绝不打印、绝不返回给客户端。
+const AUTH_CENTER_INTERNAL_TOKEN_FILE =
+  process.env.AUTH_CENTER_INTERNAL_TOKEN_FILE ||
+  path.join(__dirname, '..', '..', 'auth-server', 'internal-token');
+
+function readInternalToken() {
+  return fs.readFileSync(AUTH_CENTER_INTERNAL_TOKEN_FILE, 'utf8').trim();
+}
+
+// TOTP 重置 / 确认：身份只取网关注入的 X-Auth-User，带共享内部令牌调用认证中心内部接口
+// /api/internal/totp/reset|confirm?sub=<用户名>，**不再转发任何客户端凭证**
+// （浏览器通道无 token；App 通道带的是 JWT access_token，认证中心 SSO 会话都认不出，会 401）。
+// 两阶段语义（reset 只写 pending → confirm 验证转正）由认证中心内部实现，此处仅透传。
+// 认证中心不可达 → 502；内部令牌文件缺失/为空 → 500（日志写明原因），绝不静默成功。
+function forwardTotp(action) {
   return async (req, res) => {
     const ip = clientIp(req);
+    const sub = String((req.user && req.user.name) || req.get('x-auth-user') || '').trim();
+    if (!sub) {
+      auditLog('totp_' + action, ip, false, '缺少 X-Auth-User');
+      return res.status(401).json({ error: '未登录' });
+    }
     const base = authCenterBaseUrl();
     if (!base) {
-      auditLog('totp_' + path.split('/').pop(), ip, false, '认证中心地址未配置');
+      auditLog('totp_' + action, ip, false, '认证中心地址未配置');
       console.error('[admin-server] AUTH_CENTER_BASE_URL 未配置，无法转发 TOTP 请求');
       return res.status(502).json({ error: '认证中心不可达' });
     }
-    const url = new URL(base + path);
-    const header = req.headers.authorization || '';
-    const headerToken = header.startsWith('Bearer ') ? header.slice(7).trim() : null;
-    const queryToken = req.query && req.query.token ? String(req.query.token) : null;
-    const token = headerToken || queryToken;
-    if (token) url.searchParams.set('token', token); // 认证中心兼容 header / query 两种透传
-    const headers = { Accept: 'application/json', 'Content-Type': 'application/json' };
-    if (headerToken) headers.Authorization = header;
+    let internalToken;
+    try {
+      internalToken = readInternalToken();
+    } catch (e) {
+      auditLog('totp_' + action, ip, false, '内部令牌文件不可读');
+      console.error(
+        `[admin-server] 读取认证中心内部令牌失败（${AUTH_CENTER_INTERNAL_TOKEN_FILE}）: ${e.message}`
+      );
+      return res.status(500).json({ error: '服务未正确配置' });
+    }
+    if (!internalToken) {
+      auditLog('totp_' + action, ip, false, '内部令牌文件为空');
+      console.error(`[admin-server] 认证中心内部令牌文件为空: ${AUTH_CENTER_INTERNAL_TOKEN_FILE}`);
+      return res.status(500).json({ error: '服务未正确配置' });
+    }
+    const url = new URL(base + '/api/internal/totp/' + action);
+    url.searchParams.set('sub', sub);
+    const headers = {
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+      'X-Internal-Token': internalToken
+    };
     try {
       const upstream = await fetch(url, {
         method: 'POST',
@@ -1515,31 +1545,22 @@ function forwardTotp(path) {
         signal: AbortSignal.timeout(5000)
       });
       const data = await upstream.json().catch(() => ({}));
-      auditLog('totp_' + path.split('/').pop(), ip, upstream.ok, '转发认证中心');
+      auditLog('totp_' + action, ip, upstream.ok, '内部接口');
       return res.status(upstream.status).json(data);
     } catch (e) {
-      auditLog('totp_' + path.split('/').pop(), ip, false, '认证中心不可达: ' + e.message);
+      auditLog('totp_' + action, ip, false, '认证中心不可达: ' + e.message);
       return res.status(502).json({ error: '认证中心不可达' });
     }
   };
 }
 
-app.post('/api/admin/totp/reset', forwardTotp('/api/totp/reset'));
-app.post('/api/admin/totp/confirm', forwardTotp('/api/totp/confirm'));
+app.post('/api/admin/totp/reset', authRequired, forwardTotp('reset'));
+app.post('/api/admin/totp/confirm', authRequired, forwardTotp('confirm'));
 
 // 已登录设备管理：用户身份只取网关注入的 X-Auth-User（authRequired 已保证存在），
 // 用共享内部令牌（X-Internal-Token）调用认证中心内部接口 /api/internal/sessions*，
 // **不再转发任何客户端凭证**（浏览器无 token；App 带的是 JWT access_token，认证中心 SSO 会话认不出）。
 // GET 列表 / PUT :id/name 重命名 / DELETE :id 踢下线，路径与语义与旧转发一致。
-const AUTH_CENTER_INTERNAL_TOKEN_FILE =
-  process.env.AUTH_CENTER_INTERNAL_TOKEN_FILE ||
-  path.join(__dirname, '..', '..', 'auth-server', 'internal-token');
-
-// 读内部令牌（0600）：只读，绝不打印、绝不返回。
-function readInternalToken() {
-  return fs.readFileSync(AUTH_CENTER_INTERNAL_TOKEN_FILE, 'utf8').trim();
-}
-
 function forwardSessions(req, res) {
   const ip = clientIp(req);
   const action =
