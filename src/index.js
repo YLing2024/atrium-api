@@ -32,7 +32,7 @@ const FILE_MAX_BYTES = 500 * 1024 * 1024; // 单文件上限 500MB（与 /api/ad
 //  · FILE_ROOT_READONLY  —— 收纳目录，正常展示、可浏览，但「根这一层的那一项」不允许被删/改名/移动，子路径照常读写
 // 两者都只作用于根目录这一层：子目录中的同名文件（如 <root>/backup/swapfile）不受影响。
 const FILE_ROOT_PROTECTED = new Set(['swapfile', 'lost+found', 'cache']);
-const FILE_ROOT_READONLY = new Set(['toolchains', 'apps', 'build', 'www', 'files', 'backups']);
+const FILE_ROOT_READONLY = new Set(['toolchains', 'apps', 'build', 'www', 'files', 'backups', 'siyuan']);
 try {
   fs.mkdirSync(FILE_DIR, { recursive: true });
 } catch (e) {
