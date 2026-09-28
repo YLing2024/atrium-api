@@ -11,3 +11,7 @@ data/
 
 # 本机项目记忆（只存本地，不提交 / 不推送）
 PROJECT_MEMORY.md
+
+# 游离的空数据库（运行时产物，不入库）
+data.db
+notifications.db
