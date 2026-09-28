@@ -1483,50 +1483,27 @@ app.post('/api/admin/login', async (req, res) => {
   }
 });
 
-// SSO 验证（无鉴权，仅兼容旧客户端保留；**已废弃**：2026-09-28 起登录由 Auth Gateway 负责）。
-// 新前端不再调用；本端点签发的本地 Redis 会话也不再被 authRequired 接受（主鉴权只认 X-Auth-User）。
-app.post('/api/admin/sso/verify', async (req, res) => {
-  const { token } = req.body || {};
-  const ip = clientIp(req);
-  if (typeof token !== 'string' || !token) {
-    auditLog('sso_verify', ip, false, '缺少 token');
-    return res.status(400).json({ error: '缺少 token' });
-  }
-  let verifyRes;
-  try {
-    verifyRes = await fetch(
-      `${AUTH_CENTER_VERIFY_URL}?token=${encodeURIComponent(token)}`,
-      { headers: { Accept: 'application/json' } }
-    );
-  } catch (e) {
-    auditLog('sso_verify', ip, false, '认证中心不可达: ' + e.message);
-    return res.status(502).json({ error: '认证中心不可达' });
-  }
-  if (!verifyRes.ok) {
-    auditLog('sso_verify', ip, false, '认证中心拒绝验证');
-    return res.status(401).json({ error: '认证中心 token 无效' });
-  }
-  try {
-    // 认证通过：复用现有 session 创建逻辑，签发本地 Redis 会话
-    const localToken = crypto.randomBytes(32).toString('hex');
-    await redis.set(sessionKey(localToken), localToken, 'EX', SESSION_TTL);
-    auditLog('sso_verify', ip, true, 'ok');
-    res.json({ token: localToken });
-  } catch (e) {
-    auditLog('sso_verify', ip, false, '会话服务异常');
-    res.status(500).json({ error: '会话服务异常' });
-  }
-});
+// 认证中心基址：只从环境变量或本地配置（config.json，不入库）读取；
+// 源码不硬编码任何私有地址（含回环地址）。未配置时各转发接口返回 502。
+function authCenterBaseUrl() {
+  const configured =
+    process.env.AUTH_CENTER_BASE_URL || (config.get() && config.get().auth_center_base_url);
+  return configured ? String(configured).replace(/\/+$/, '') : '';
+}
 
 // TOTP 重置 / 确认：转发到认证中心（带 Authorization 透传，认证中心校验 Redis 会话），
-// 由认证中心执行标准两阶段重置（reset 生成 pending → confirm 验证转正）
-const AUTH_CENTER_BASE_URL =
-  process.env.AUTH_CENTER_BASE_URL || 'http://127.0.0.1:3200';
-
+// 由认证中心执行标准两阶段重置（reset 生成 pending → confirm 验证转正）。
+// 注：这两个端点是 nginx 白名单保留的旧通道，认证中心侧仍走 requireSession，本次保留不动。
 function forwardTotp(path) {
   return async (req, res) => {
     const ip = clientIp(req);
-    const url = new URL(AUTH_CENTER_BASE_URL + path);
+    const base = authCenterBaseUrl();
+    if (!base) {
+      auditLog('totp_' + path.split('/').pop(), ip, false, '认证中心地址未配置');
+      console.error('[admin-server] AUTH_CENTER_BASE_URL 未配置，无法转发 TOTP 请求');
+      return res.status(502).json({ error: '认证中心不可达' });
+    }
+    const url = new URL(base + path);
     const header = req.headers.authorization || '';
     const headerToken = header.startsWith('Bearer ') ? header.slice(7).trim() : null;
     const queryToken = req.query && req.query.token ? String(req.query.token) : null;
@@ -1554,30 +1531,59 @@ function forwardTotp(path) {
 app.post('/api/admin/totp/reset', forwardTotp('/api/totp/reset'));
 app.post('/api/admin/totp/confirm', forwardTotp('/api/totp/confirm'));
 
-// 已登录设备管理：转发到认证中心 /api/sessions*（列表 / 重命名 / 删除）。
-// 方法/query/Authorization 透传；GET 无 body，PUT/DELETE 带 JSON body；
-// token 同时拼到 query（认证中心兼容 header / query 两种透传）
+// 已登录设备管理：用户身份只取网关注入的 X-Auth-User（authRequired 已保证存在），
+// 用共享内部令牌（X-Internal-Token）调用认证中心内部接口 /api/internal/sessions*，
+// **不再转发任何客户端凭证**（浏览器无 token；App 带的是 JWT access_token，认证中心 SSO 会话认不出）。
+// GET 列表 / PUT :id/name 重命名 / DELETE :id 踢下线，路径与语义与旧转发一致。
+const AUTH_CENTER_INTERNAL_TOKEN_FILE =
+  process.env.AUTH_CENTER_INTERNAL_TOKEN_FILE ||
+  path.join(__dirname, '..', '..', 'auth-server', 'internal-token');
+
+// 读内部令牌（0600）：只读，绝不打印、绝不返回。
+function readInternalToken() {
+  return fs.readFileSync(AUTH_CENTER_INTERNAL_TOKEN_FILE, 'utf8').trim();
+}
+
 function forwardSessions(req, res) {
   const ip = clientIp(req);
-  const url = new URL(AUTH_CENTER_BASE_URL + '/api/sessions' + req.path);
-  const header = req.headers.authorization || '';
-  const headerToken = header.startsWith('Bearer ') ? header.slice(7).trim() : null;
-  const queryToken = req.query && req.query.token ? String(req.query.token) : null;
-  const token = headerToken || queryToken;
-  if (token) url.searchParams.set('token', token); // 认证中心兼容 header / query 两种透传
-  const headers = { Accept: 'application/json' };
-  if (headerToken) headers.Authorization = header;
+  const action =
+    req.method === 'GET' ? 'list' : req.method === 'PUT' ? 'rename' : req.method === 'DELETE' ? 'delete' : req.method.toLowerCase();
+  const sub = (req.user && req.user.name) || req.get('x-auth-user') || '';
+  const base = authCenterBaseUrl();
+  if (!base) {
+    auditLog('sessions_' + action, ip, false, '认证中心地址未配置');
+    console.error('[admin-server] AUTH_CENTER_BASE_URL 未配置，无法转发设备会话请求');
+    return res.status(502).json({ error: '认证中心不可达' });
+  }
+  let internalToken;
+  try {
+    internalToken = readInternalToken();
+  } catch (e) {
+    auditLog('sessions_' + action, ip, false, '内部令牌文件不可读');
+    console.error(
+      `[admin-server] 读取认证中心内部令牌失败（${AUTH_CENTER_INTERNAL_TOKEN_FILE}）: ${e.message}`
+    );
+    return res.status(500).json({ error: '服务未正确配置' });
+  }
+  if (!internalToken) {
+    auditLog('sessions_' + action, ip, false, '内部令牌文件为空');
+    console.error(`[admin-server] 认证中心内部令牌文件为空: ${AUTH_CENTER_INTERNAL_TOKEN_FILE}`);
+    return res.status(500).json({ error: '服务未正确配置' });
+  }
+  // req.path 在 app.use 挂载点下已是相对路径：GET → '/'，PUT → '/:id/name'，DELETE → '/:id'
+  const relPath = req.path === '/' ? '' : req.path;
+  const url = new URL(base + '/api/internal/sessions' + relPath);
+  url.searchParams.set('sub', String(sub));
+  const headers = { Accept: 'application/json', 'X-Internal-Token': internalToken };
   const opts = { method: req.method, headers, signal: AbortSignal.timeout(5000) };
   if (req.method !== 'GET' && req.method !== 'HEAD') {
     headers['Content-Type'] = 'application/json';
     opts.body = JSON.stringify(req.body || {});
   }
-  const action =
-    req.method === 'GET' ? 'list' : req.method === 'PUT' ? 'rename' : req.method === 'DELETE' ? 'delete' : req.method.toLowerCase();
   fetch(url, opts)
     .then(async (upstream) => {
       const data = await upstream.json().catch(() => ({}));
-      auditLog('sessions_' + action, ip, upstream.ok, '转发认证中心');
+      auditLog('sessions_' + action, ip, upstream.ok, '内部接口');
       return res.status(upstream.status).json(data);
     })
     .catch((e) => {
