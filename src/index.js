@@ -38,7 +38,8 @@ const FILE_MAX_BYTES = 500 * 1024 * 1024; // 单文件上限 500MB（与 /api/ad
 //  · FILE_ROOT_READONLY  —— 收纳目录，正常展示、可浏览，但「根这一层的那一项」不允许被删/改名/移动，子路径照常读写
 // 两者都只作用于根目录这一层：子目录中的同名文件（如 <root>/backup/swapfile）不受影响。
 const FILE_ROOT_PROTECTED = new Set(['swapfile', 'lost+found', 'cache']);
-const FILE_ROOT_READONLY = new Set(['toolchains', 'apps', 'build', 'www', 'files', 'backups', 'siyuan']);
+const FILE_ROOT_READONLY = new Set(['toolchains', 'apps', 'build', 'www', 'files', 'backups', 'siyuan',
+                                    'nextcloud']);  // 2026-09-29 Nextcloud 数据目录
 try {
   fs.mkdirSync(FILE_DIR, { recursive: true });
 } catch (e) {
@@ -1862,7 +1863,10 @@ app.delete('/api/admin/api-tokens/:id', authRequired, async (req, res) => {
 });
 
 // TOTP 首次设置：挂载 totp-auth 模块路由（无鉴权，secret 已配置则 409）
+// sso 模式下不提供任何本地口令入口 → /setup 一律 404（否则会变成一个免鉴权的密钥签发口，
+// 而 sso 模式根本不使用 TOTP，没必要暴露）。/reset 与 /confirm 仍由 authRequired 保护。
 app.use('/api/admin/totp', (req, res, next) => {
+  if (AUTH_MODE === 'sso' && req.path === '/setup') return res.status(404).json({ error: 'Not Found' });
   const ip = clientIp(req);
   res.on('finish', () => {
     if (req.path === '/setup') {
