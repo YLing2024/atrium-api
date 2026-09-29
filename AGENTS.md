@@ -90,12 +90,14 @@ admin「应用」Tab 的后端：一个**只读**面板，把本机应用集中�
   `mtime` 变化即重读（改登记表无需重启）。样例见 `apps.example.json`（占位值）。缺失 → `200 + apps:[] + notice`；解析失败 → `500 + {error}`。
 - **schema**：顶层 `version / updated / ignorePorts[] / ignoreProcesses[] / categories[] / apps[]`。
   `categories[] = {id,name}`；`apps[]` 字段：`id`(唯一，`^[a-z0-9][a-z0-9-]{0,31}$`)、`name`(≤16 字)、`category`、
-  `desc`(≤24 字)、`url`、`icon`(1 字符，缺省取 name 首字)、`port`、`unit`(systemd)、`container`(docker)、
-  `probe`、`tags`、`hidden`。重复 id 保留第一条并记 `warning`；未知 category 归入「其他」。
+  `desc`(≤24 字)、`url`、`icon`(图标名，字符串；缺省/null 时前端回退 name 首字)、`onDemand`(布尔，默认 `false`；按需唤醒应用)、
+  `port`、`unit`(systemd)、`container`(docker)、`probe`、`tags`、`hidden`。重复 id 保留第一条并记 `warning`；未知 category 归入「其他」。
 - **探活**：优先级 `probe > container > unit > port(tcp) > 无(unknown)`。
   `probe` 形如 `{type:"http",target,expect?}` / `{type:"systemd",unit}` / `{type:"docker",container}` / `{type:"tcp",port}`。
   状态：`up`（2xx/3xx 或 expect 命中 / systemd active / docker running / tcp 通）、`auth`（http 401/403）、
   `degraded`（http 5xx 或超时 / activating|reloading / restarting|paused）、`down`、`unknown`。
+  另有 `idle → 休眠（按需唤醒应用当前未运行，非故障）`：仅当 `onDemand:true` 且探活结果为 `down` 时归入，不计入宕机；
+  `onDemand` 不改变 up / auth / degraded 等任何其它判定。
   单条超时 1500ms，全部 `Promise.allSettled` 并行；单条异常只影响该条（`status:"down"`）。
 - **未登记发现**：`ss -ltnp` 取 `127.0.0.1:` 监听行，排除 `ignorePorts` / `ignoreProcesses`（进程名正则，滤掉 chrome、agent-browser 这类端口每次都在变的工具监听）/ 已登记 `port` / `docker-proxy`，按端口升序最多 30 条；解析失败返回 `[]`，不影响 `apps`。
 - **审计**：`apps_list` 只记条数 / 耗时 / 失败条数，**不记录登记表里的 `url`**（可能含内网地址）。
