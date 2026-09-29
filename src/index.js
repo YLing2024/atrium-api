@@ -23,6 +23,12 @@ const config = require('./config');
 
 const PORT = parseInt(process.env.PORT, 10) || 3100;
 const HOST = process.env.HOST || '0.0.0.0';
+// 管理端认证模式：
+//   builtin（默认）—— 自带账号 + 本地会话（开源用户开箱即用；TOTP 登录、Bearer/cookie 会话）
+//   sso           —— 关掉自带口令，身份只看前置认证层注入的 X-Auth-User
+// 取值非法或未设置一律按 builtin（仓库公开，默认必须是自带账号）。
+const AUTH_MODE =
+  String(process.env.AUTH_MODE || 'builtin').toLowerCase() === 'sso' ? 'sso' : 'builtin';
 const UPLOAD_DIR = process.env.ADMIN_UPLOAD_DIR || path.join(__dirname, '..', 'uploads'); // 上传文件目录
 // 文件区：admin「文件」Tab 的上传落点。独立于 uploads/，专用于把文件传给 Hermes（保留原始文件名）
 const FILE_DIR = process.env.ADMIN_FILE_DIR || '/root/files/download';
@@ -173,11 +179,68 @@ const auth = createTotpAuth({
   rateLimit: { maxFailures: 5, lockout: [60, 300, 900] },
 });
 
-// 鉴权中间件：
-//   用户身份只认 Auth Gateway 注入的请求头 `X-Auth-User`（网关会先剥掉客户端伪造的同名头）。
-//   存在且非空 → 通过并把 req.user 设为其值；缺失/为空 → 401（不 302、不 500）。
-//   兼容旧客户端/自动化脚本所需的本地会话与接口令牌已不再作为本中间件的凭证来源。
+// 手工解析 Cookie 头取指定字段（无 cookie-parser 依赖）
+function readCookie(req, name) {
+  const raw = req.headers.cookie || '';
+  for (const part of String(raw).split(';')) {
+    const idx = part.indexOf('=');
+    if (idx === -1) continue;
+    if (part.slice(0, idx).trim() === name) return part.slice(idx + 1).trim();
+  }
+  return '';
+}
+
+// 自带账号会话 token：Authorization: Bearer 优先，其次 HttpOnly cookie admin_session
+function builtinSessionToken(req) {
+  const header = req.headers.authorization || '';
+  if (header.startsWith('Bearer ')) {
+    const t = header.slice(7).trim();
+    if (t) return t;
+  }
+  return readCookie(req, 'admin_session');
+}
+
+// 下发自带账号会话 cookie：Path=/; HttpOnly; SameSite=Lax；HTTPS（X-Forwarded-Proto / req.secure）下加 Secure
+function setSessionCookie(req, res, token) {
+  const proto = String(req.get('x-forwarded-proto') || '').split(',')[0].trim();
+  const secure = proto === 'https' || req.secure;
+  const parts = [
+    `admin_session=${token}`,
+    'Path=/',
+    'HttpOnly',
+    'SameSite=Lax',
+    `Max-Age=${SESSION_TTL}`
+  ];
+  if (secure) parts.push('Secure');
+  res.append('Set-Cookie', parts.join('; '));
+}
+
+// 清除会话 cookie（登出）
+function clearSessionCookie(res) {
+  res.append('Set-Cookie', 'admin_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0');
+}
+
+// 鉴权中间件：按 AUTH_MODE 分支
+//   builtin —— 自带账号会话：`Authorization: Bearer <token>` 或 cookie `admin_session`，
+//             在 Redis 校验 `admin:session:<token>`，命中即通过并滑动续期；**忽略外部 X-Auth-User**（防提权）。
+//   sso     —— 只认前置认证层注入的 `X-Auth-User`（网关会先剥掉客户端伪造的同名头）。
+// 两种情况失败都返回 401 JSON（不 302、不 500）。
 async function authRequired(req, res, next) {
+  if (AUTH_MODE === 'builtin') {
+    const token = builtinSessionToken(req);
+    if (token) {
+      try {
+        if (await redis.get(sessionKey(token))) {
+          await redis.expire(sessionKey(token), SESSION_TTL); // 滑动续期，沿用现有 TTL
+          req.user = { role: 'admin', name: 'admin', via: 'builtin' };
+          return next();
+        }
+      } catch (e) {
+        return res.status(500).json({ error: '会话服务异常' });
+      }
+    }
+    return res.status(401).json({ error: '未登录' });
+  }
   const xAuthUser = req.get('x-auth-user');
   if (xAuthUser && String(xAuthUser).trim()) {
     req.user = { role: 'admin', name: String(xAuthUser).trim(), via: 'gateway' };
