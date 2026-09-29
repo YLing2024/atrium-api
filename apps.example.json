@@ -1,0 +1,71 @@
+{
+  "version": 1,
+  "updated": "2026-01-01",
+  "ignorePorts": [36921, 39565, 39853, 49374],
+  "categories": [
+    { "id": "self", "name": "自研" },
+    { "id": "third", "name": "第三方" },
+    { "id": "infra", "name": "基础设施" },
+    { "id": "site", "name": "站点" }
+  ],
+  "apps": [
+    {
+      "id": "admin",
+      "name": "管理后台",
+      "category": "self",
+      "desc": "系统 / 应用 / 文件 / 终端",
+      "url": "https://admin.example.com",
+      "icon": "管",
+      "port": 3100,
+      "unit": "admin-server",
+      "probe": { "type": "http", "target": "http://127.0.0.1:3100/api/admin/auth-mode", "expect": [200, 404] },
+      "tags": ["node"]
+    },
+    {
+      "id": "memos",
+      "name": "Memos",
+      "category": "third",
+      "desc": "碎片笔记",
+      "url": "https://memos.example.com",
+      "container": "memos",
+      "port": 5230,
+      "probe": { "type": "docker", "container": "memos" }
+    },
+    {
+      "id": "nginx",
+      "name": "Nginx",
+      "category": "infra",
+      "desc": "入口网关",
+      "icon": "N",
+      "port": 80,
+      "unit": "nginx",
+      "probe": { "type": "systemd", "unit": "nginx" }
+    },
+    {
+      "id": "redis",
+      "name": "Redis",
+      "category": "infra",
+      "desc": "缓存与会话",
+      "icon": "R",
+      "port": 6379,
+      "probe": { "type": "tcp", "port": 6379 }
+    },
+    {
+      "id": "docs",
+      "name": "文档站",
+      "category": "site",
+      "desc": "自建文档",
+      "url": "https://doc.example.com",
+      "icon": "文",
+      "probe": { "type": "http", "target": "https://doc.example.com", "expect": [200] },
+      "tags": ["http"]
+    },
+    {
+      "id": "pending",
+      "name": "待登记",
+      "category": "site",
+      "desc": "暂无探活方式",
+      "url": "https://pending.example.com"
+    }
+  ]
+}
