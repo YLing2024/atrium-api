@@ -1502,45 +1502,88 @@ app.get('/', (req, res) => {
   res.json({ name: 'admin-server', status: 'ok' });
 });
 
-// 登录：TOTP 动态验证码比对（复用 totp-auth 模块的 verifyCode），成功后写入 Redis 独立会话
-app.post('/api/admin/login', async (req, res) => {
-  const { code } = req.body || {};
-  const ip = clientIp(req);
-  try {
-    // 首次使用：secret 未配置时引导先设置
-    const secret = auth.getSecret();
-    if (!secret) {
-      auditLog('login', ip, false, 'TOTP 未配置');
-      return res
-        .status(403)
-        .json({ error: '首次使用：请先设置 TOTP', code: 'totp_setup_required' });
-    }
-    // 锁定检查：同一 IP 连续失败已达上限（60s 锁定内），直接 429 拒绝
-    const rate = loginRateCheck(ip);
-    if (rate.locked) {
-      auditLog('login', ip, false, `锁定中（剩余 ${rate.remain}s）`);
-      return res.status(429).json({
-        error: `尝试过多，请 ${rate.remain} 秒后再试`,
-        code: 'rate_limited',
-        retryAfter: rate.remain
-      });
-    }
-    if (!auth.verifyCode(secret, code)) {
-      const rec = loginRateFail(ip);
-      auditLog('login', ip, false, `验证码错误（第 ${rec.count}/${LOGIN_MAX_FAILS} 次）`);
-      return res.status(401).json({ error: '验证码错误' });
-    }
-    // 登录成功：清除该 IP 失败计数，签发会话
-    loginRateClear(ip);
-    auditLog('login', ip, true, 'ok');
-    const token = crypto.randomBytes(32).toString('hex');
-    await redis.set(sessionKey(token), token, 'EX', SESSION_TTL);
-    res.json({ token });
-  } catch (e) {
-    auditLog('login', ip, false, '会话服务异常');
-    res.status(500).json({ error: '会话服务异常' });
-  }
+// 认证模式探测：免鉴权，只回模式，不泄漏任何其它信息（前端据此决定登录界面/跳转策略）
+app.get('/api/admin/auth-mode', (req, res) => {
+  res.json({ authMode: AUTH_MODE });
 });
+
+// 登录：TOTP 动态验证码比对（复用 totp-auth 模块的 verifyCode），成功后写入 Redis 独立会话并下发会话 cookie。
+// sso 模式下不提供本地登录入口 → 404（不要 401/302，避免暴露）。
+app.post(
+  '/api/admin/login',
+  (req, res, next) => {
+    if (AUTH_MODE === 'sso') return res.status(404).json({ error: 'Not Found' });
+    next();
+  },
+  async (req, res) => {
+    const { code } = req.body || {};
+    const ip = clientIp(req);
+    try {
+      // 首次使用：secret 未配置时引导先设置
+      const secret = auth.getSecret();
+      if (!secret) {
+        auditLog('login', ip, false, 'TOTP 未配置');
+        return res
+          .status(403)
+          .json({ error: '首次使用：请先设置 TOTP', code: 'totp_setup_required' });
+      }
+      // 锁定检查：同一 IP 连续失败已达上限（60s 锁定内），直接 429 拒绝
+      const rate = loginRateCheck(ip);
+      if (rate.locked) {
+        auditLog('login', ip, false, `锁定中（剩余 ${rate.remain}s）`);
+        return res.status(429).json({
+          error: `尝试过多，请 ${rate.remain} 秒后再试`,
+          code: 'rate_limited',
+          retryAfter: rate.remain
+        });
+      }
+      if (!auth.verifyCode(secret, code)) {
+        const rec = loginRateFail(ip);
+        auditLog('login', ip, false, `验证码错误（第 ${rec.count}/${LOGIN_MAX_FAILS} 次）`);
+        return res.status(401).json({ error: '验证码错误' });
+      }
+      // 登录成功：清除该 IP 失败计数，签发会话；同时下发 HttpOnly 会话 cookie（TTL 与 Redis 会话一致）
+      loginRateClear(ip);
+      auditLog('login', ip, true, 'ok');
+      const token = crypto.randomBytes(32).toString('hex');
+      await redis.set(sessionKey(token), token, 'EX', SESSION_TTL);
+      setSessionCookie(req, res, token);
+      res.json({ token });
+    } catch (e) {
+      auditLog('login', ip, false, '会话服务异常');
+      res.status(500).json({ error: '会话服务异常' });
+    }
+  }
+);
+
+// 登出：删除 Redis 会话 + 清 cookie，幂等（未登录也 200）。sso 模式 → 404。
+app.post('/api/admin/logout', async (req, res) => {
+  if (AUTH_MODE === 'sso') return res.status(404).json({ error: 'Not Found' });
+  const token = builtinSessionToken(req);
+  if (token) {
+    try {
+      await redis.del(sessionKey(token));
+    } catch (e) {
+      // 登出幂等：Redis 异常也不阻断，cookie 照清
+    }
+  }
+  clearSessionCookie(res);
+  auditLog('logout', clientIp(req), true, 'ok');
+  res.json({ ok: true });
+});
+
+// 当前登录身份（来自本地会话）。sso 模式 → 404；builtin 未登录 → 401。
+app.get(
+  '/api/admin/me',
+  (req, res, next) => {
+    if (AUTH_MODE === 'sso') return res.status(404).json({ error: 'Not Found' });
+    next();
+  },
+  authRequired,
+  (req, res) => {
+    res.json({ name: req.user.name, role: req.user.role });
+  }
+);
 
 // 认证中心基址：只从环境变量或本地配置（config.json，不入库）读取；
 // 源码不硬编码任何私有地址（含回环地址）。未配置时各转发接口返回 502。
@@ -3479,6 +3522,9 @@ app.get('/api/admin/history/:id', authRequired, (req, res) => {
 
 app.listen(PORT, HOST, () => {
   console.log(`[admin-server] 已启动，监听地址: ${HOST}:${PORT}`);
+  console.log(
+    `[admin-server] 管理端认证模式: ${AUTH_MODE === 'sso' ? 'SSO（信任 X-Auth-User）' : '自带账号（builtin）'}`
+  );
   console.log(`[admin-server] 上传目录: ${UPLOAD_DIR}`);
   console.log(`[admin-server] 配置文件: ${config.CONFIG_PATH}`);
   console.log(`[admin-server] 提示: 登录使用 TOTP 动态验证码，secret 见 config.json 的 totp_secret 字段`);
