@@ -6,21 +6,22 @@
 
 - REST：`/api/admin/system`、`/api/admin/system/history`、`/api/admin/services`、`/api/admin/versions`、`/api/admin/upload`、`/api/admin/download`、`/api/admin/password`
 - 历史浏览（只读）：`/api/admin/history`（会话列表）、`/api/admin/history/:id`（会话消息），数据源为 Hermes `~/.hermes/state.db`（`node:sqlite` 只读打开，请求内 open→query→close）
-- 登录：登录 / TOTP / SSO 全部由 Auth Gateway 负责；本服务只读网关注入的 `X-Auth-User`。`/api/admin/login` 保留但不再由前端引导使用；`/api/admin/totp/reset|confirm` 取 `X-Auth-User` 后经内部令牌调认证中心 `/api/internal/totp/*`
+- 登录：`GET /api/admin/auth-mode` 探测模式。`builtin`（默认）走本服务自带 TOTP 登录；`sso` 关掉自带口令，管理端身份由 `X-Auth-User` 决定（见「认证（AUTH_MODE）」）
 
-## 鉴权接入架构（Auth Gateway）
+## 认证（AUTH_MODE）
 
-1. 用户在 Auth Gateway（Go 单二进制，`127.0.0.1:18920`，nginx 反代进来）完成登录（TOTP 在认证中心）；会话由网关的站点 cookie 持有。
-2. 浏览器请求 `/api/admin/*`：nginx 交给网关，网关鉴权通过后**注入 `X-Auth-User` 头**再反代到 admin-server。
-3. admin-server 的 `authRequired` **只读该头**：存在且非空 → 通过；缺失/为空 → `401 {error:'未登录'}`。
-4. 前端不再存 token、不再需要认证中心地址。
+默认自带账号口令（TOTP）开箱即用；也可以关掉自带口令。
 
-### 已废弃（仅旧客户端兼容保留）
+| 模式 | 说明 |
+|---|---|
+| `builtin`（默认） | 自带账号 + 登录页，开箱即用 |
+| `sso` | 关掉自带口令，管理端身份由 `X-Auth-User` 决定——自家项目接 SSO 时走这一档 |
 
-- Redis 会话（`admin:session:<token>`）与接口令牌（`api:token:<sha256>`）**不再是 `/api/admin/*` 的凭证**；
-- `POST /api/admin/sso/verify` 与 `AUTH_CENTER_VERIFY_URL` 已删除，nginx `auth_request /auth-check` 探针已废弃；
-- 设备会话 `/api/admin/sessions*` 与 TOTP 重置 `/api/admin/totp/*` 只认 `X-Auth-User`，经内部令牌调认证中心 `/api/internal/sessions*`、`/api/internal/totp/*?sub=`，不再转发客户端凭证；
-- 通知写入（`notificationsWriteAuth`）仍接受回环直连与可写 API Token，是独立通道。
+关掉后的登录跳转与 401 由你前面的认证层决定，本服务不再展开。
+
+- 模式探测：`GET /api/admin/auth-mode`（免鉴权）→ `{"authMode":"builtin"|"sso"}`。
+- `builtin`：`POST /api/admin/login`（TOTP 动态码，成功下发 HttpOnly 会话 cookie）、`POST /api/admin/logout`、`GET /api/admin/me`。
+- 接口令牌（API Token）通道两种模式都保留。
 
 ## 运行
 

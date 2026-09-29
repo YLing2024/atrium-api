@@ -16,7 +16,7 @@
 - **Hermes 历史会话只读浏览**（直接读 `~/.hermes/state.db`）
 - **Web 终端**：口令二次验证 + 票据签发 + ttyd 会话管理
 
-监听 `127.0.0.1:3100`（systemd `admin-server.service`），由 nginx 交给 Auth Gateway（`127.0.0.1:18920`）鉴权后反代进来。
+监听 `127.0.0.1:3100`（systemd `admin-server.service`）。默认自带账号口令，也可用 `AUTH_MODE=sso` 关掉自带口令、交给前置认证层（见「认证模型（AUTH_MODE）」）。
 
 ## 技术栈
 
@@ -50,7 +50,10 @@ npm start        # = node src/index.js，监听 3100
 
 | 方法 | 路径 | 鉴权 | 说明 |
 |---|---|---|---|
-| POST | `/api/admin/login` | 无 | TOTP 登录（过渡期保留） |
+| GET | `/api/admin/auth-mode` | 无 | 模式探测 → `{"authMode":"builtin"\|"sso"}` |
+| POST | `/api/admin/login` | 无 | `builtin` 专属：TOTP 登录，成功下发会话 cookie；`sso` → 404 |
+| POST | `/api/admin/logout` | 无 | `builtin` 专属：删会话 + 清 cookie（幂等）；`sso` → 404 |
+| GET | `/api/admin/me` | ✅ | `builtin` 专属：`{name, role}`；`sso` → 404 |
 | GET | `/api/admin/system` | ✅ | 系统信息快照 |
 | GET | `/api/admin/system/history` | ✅ | 历史采样 |
 | GET | `/api/admin/system/stream` | ✅ | SSE 实时推送 |
@@ -74,19 +77,28 @@ npm start        # = node src/index.js，监听 3100
 | GET | `/api/admin/term/verify` | 仅本机 | ttyd wrapper 校验票据（127.0.0.1） |
 | GET/POST/DELETE | `/api/admin/term/sessions` | ✅ | 终端会话列表 / 关闭 |
 
-## 鉴权模型
+## 认证模型（`AUTH_MODE`）
 
-1. **主路径（唯一）**：登录 / OAuth2 / state+PKCE / 会话全部由 **Auth Gateway**（`127.0.0.1:18920`，nginx 反代进来）负责。网关注入请求头 `X-Auth-User`，本服务 `authRequired` 只读该头：存在且非空 → 通过；缺失/为空 → `401 {error:'未登录'}`（不 302、不 500）。nginx 里**不再有** `auth_request` / `/auth-check` / `?token=`。
-2. **已废弃（仅旧客户端兼容保留，不再作为 `/api/admin/*` 凭证）**：Redis 会话（`admin:session:<token>`，12h 滑动）、接口令牌（`api:token:<sha256>`）。TOTP 端点 `/api/admin/login` 保留不动，但不再由前端引导使用；`/api/admin/totp/*` 已改为内部转发（见下）。`POST /api/admin/sso/verify` 与 `AUTH_CENTER_VERIFY_URL` 已**删除**（2026-09-29）。
-3. 设备会话（`/api/admin/sessions*`）与 TOTP 重置（`/api/admin/totp/*`）**不再转发任何客户端凭证**：身份取 `X-Auth-User`，用共享内部令牌 `X-Internal-Token` 调认证中心内部接口（`/api/internal/sessions*`、`/api/internal/totp/*?sub=`）；令牌文件只读，绝不出现在日志/响应/审计里。TOTP 两阶段语义（reset 只写 pending → confirm 验证转正）由认证中心内部实现，本服务仅透传。
-4. 例外：通知写入（`notificationsWriteAuth`）仍接受「回环直连」与可写 API Token（`canWrite===true`），这是独立通道，不在本次改动范围。
-5. 客户端 IP 一律用 `clientIp()` 读 **`X-Real-IP`**（`req.ip` 恒为 127.0.0.1 会导致限流退化成全局桶、审计日志丢真实 IP）。
+默认自带账号口令，开箱即用；也可以关掉自带口令。
+
+| `AUTH_MODE` | 行为 |
+|---|---|
+| `builtin`（默认） | 自带账号 + 登录页；`authRequired` 认本服务会话（`Authorization: Bearer <token>` 或 HttpOnly cookie `admin_session`，Redis `admin:session:<token>` 命中即通过并滑动续期）；**忽略外部 `X-Auth-User`**，不因外部头提权 |
+| `sso` | 关掉自带口令，管理端身份由 `X-Auth-User` 决定——自家项目接 SSO 时走这一档；`authRequired` 只认该头 |
+
+关掉后的登录跳转与 401 由你前面的认证层决定，本服务不再展开。
+
+- 模式探测：`GET /api/admin/auth-mode`（免鉴权）→ `{"authMode":"builtin"|"sso"}`；取值非法/未设置按 `builtin`，启动时 stdout 打印一行当前模式。
+- `builtin` 独有：`POST /api/admin/login`（TOTP，成功除 `{token}` 外下发 HttpOnly cookie `admin_session`）、`POST /api/admin/logout`（删 Redis 会话 + 清 cookie，幂等）、`GET /api/admin/me` → `{name, role}`。`sso` 下这三者一律 `404`（不 401/302）。
+- 与模式无关、保持现状：接口令牌（`api:token:<sha256>`）通道；通知写入回环/可写令牌通道；设备会话 `/api/admin/sessions*` 与 TOTP 重置 `/api/admin/totp/*` 经内部令牌 `X-Internal-Token` 调认证中心 `/api/internal/*`（令牌只读、不打印、不返回）。
+- 客户端 IP 一律用 `clientIp()` 读 **`X-Real-IP`**（`req.ip` 恒为 127.0.0.1 会导致限流退化成全局桶、审计日志丢真实 IP）。
 
 ## 环境变量
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `PORT` / `HOST` | `3100` / `127.0.0.1` | systemd 里设置了 `HOST=127.0.0.1` |
+| `AUTH_MODE` | `builtin` | 认证模式：`builtin`（自带账号 + 登录页）/ `sso`（关掉自带口令，只看 `X-Auth-User`）；非法/未设置按 `builtin` |
 | `ADMIN_CONFIG_PATH` | `../config.json` | 配置文件路径 |
 | `ADMIN_UPLOAD_DIR` | `../uploads` | 上传目录 |
 | `ADMIN_FILE_DIR` | `/root/files/download` | 文件区根目录（admin「文件」Tab；所有路径严格限制在其内） |
@@ -125,7 +137,7 @@ systemctl status admin-server
 journalctl -u admin-server -n 100 --no-pager
 ```
 
-nginx 层：`/api/admin/*` → Auth Gateway（`127.0.0.1:18920`）鉴权后反代 `127.0.0.1:3100`；网关登录/回调/登出/me 走 `/_auth/`。配置里不再有 `auth_request` / `/auth-check` / `?token=`。
+nginx 层：`/api/admin/*` → 反代 `127.0.0.1:3100`（认证方式见「认证模型（AUTH_MODE）」；默认 `builtin` 自带账号，`sso` 时由前置认证层决定）。
 
 ## 项目记忆（PROJECT_MEMORY.md）
 
