@@ -20,6 +20,7 @@ const multer = require('multer');
 const { DatabaseSync } = require('node:sqlite');
 const { createTotpAuth } = require('totp-auth');
 const config = require('./config');
+const appsService = require('./apps');
 
 const PORT = parseInt(process.env.PORT, 10) || 3100;
 const HOST = process.env.HOST || '0.0.0.0';
@@ -2544,6 +2545,28 @@ app.get('/api/admin/services', authRequired, async (req, res) => {
     res.json(await buildServicesPayload());
   } catch (e) {
     res.status(500).json({ error: '获取服务状态失败: ' + e.message });
+  }
+});
+
+/* ============ 应用面板（Apps Panel） ============ */
+
+// 应用登记表 + 探活：只读消费，逻辑见 src/apps.js。
+// 模块级缓存 TTL 10s + 单飞（并发复用同一 Promise），refresh=1 绕过缓存。
+const appsCollector = appsService.createCollector({ checkTcpPort });
+
+app.get('/api/admin/apps', authRequired, async (req, res) => {
+  const ip = clientIp(req);
+  const t0 = Date.now();
+  const refresh = req.query.refresh === '1' || req.query.refresh === 'true';
+  try {
+    const payload = await appsCollector.getPayload(refresh);
+    const failed = payload.apps.filter((a) => a.status === 'down').length;
+    // 审计只记条数 / 耗时 / 失败条数，绝不记录登记表里的 url
+    auditLog('apps_list', ip, true, `apps=${payload.apps.length} failed=${failed} ms=${Date.now() - t0}`);
+    res.json(payload);
+  } catch (e) {
+    auditLog('apps_list', ip, false, `ms=${Date.now() - t0}`);
+    res.status(500).json({ error: e.message });
   }
 });
 

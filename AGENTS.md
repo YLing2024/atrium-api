@@ -30,7 +30,9 @@
 ```
 src/
 ├── index.js    # 全部路由 + 采样器 + 鉴权中间件（单文件，1600+ 行）
+├── apps.js     # 应用面板：登记表读取 + 探活采集（CommonJS，被 index.js require）
 └── config.js   # config.json 读写（首次运行自动生成，含初始密码）
+apps.example.json   # 应用登记表样例（占位值，入库；复制到 data/apps.json 使用）
 config.json         # 本地生成，不入库（.gitignore）
 uploads/            # 上传目录，不入库
 data/               # 运行时数据（用户配置/日志，可能含密钥），不入库
@@ -59,6 +61,7 @@ npm start        # = node src/index.js，监听 3100
 | GET | `/api/admin/system/stream` | ✅ | SSE 实时推送 |
 | GET | `/api/admin/versions` | ✅ | 软件版本 |
 | GET | `/api/admin/services` | ✅ | systemd 服务状态 |
+| GET | `/api/admin/apps` | ✅ | 应用面板：登记表全部应用 + 实时探活（`?refresh=1` 绕过 10s 缓存）；只读 |
 | POST | `/api/admin/upload` | ✅ | multipart，字段名 `file`（上限 100MB） |
 | GET | `/api/admin/download?path=` | ✅ | 仅限 `uploads/` 内 |
 | GET | `/api/admin/files?path=` | ✅ | 文件区列目录（`{ path, parent, entries[] }`，目录在前） |
@@ -76,6 +79,26 @@ npm start        # = node src/index.js，监听 3100
 | POST | `/api/admin/term/unlock` | ✅ | 校验终端口令 → 下发 12h 票据 |
 | GET | `/api/admin/term/verify` | 仅本机 | ttyd wrapper 校验票据（127.0.0.1） |
 | GET/POST/DELETE | `/api/admin/term/sessions` | ✅ | 终端会话列表 / 关闭 |
+
+## 应用面板（Apps Panel）
+
+admin「应用」Tab 的后端：一个**只读**面板，把本机应用集中展示 + 实时探活。不启停服务、不改配置。
+
+- **接口**：`GET /api/admin/apps`（`authRequired`）。`?refresh=1` 跳过 10s 模块级缓存；并发请求单飞复用同一 Promise。
+  响应字段：`generatedAt / cached / ttlSeconds / registryPath / registryMtime / notice / warning / categories[] / apps[] / discovered[]`。
+- **登记表**：`data/apps.json`（`ADMIN_APPS_FILE` 覆盖，默认 `<repo>/data/apps.json`）。**只读消费，不存在不自动生成**；
+  `mtime` 变化即重读（改登记表无需重启）。样例见 `apps.example.json`（占位值）。缺失 → `200 + apps:[] + notice`；解析失败 → `500 + {error}`。
+- **schema**：顶层 `version / updated / ignorePorts / categories[] / apps[]`。
+  `categories[] = {id,name}`；`apps[]` 字段：`id`(唯一，`^[a-z0-9][a-z0-9-]{0,31}$`)、`name`(≤16 字)、`category`、
+  `desc`(≤24 字)、`url`、`icon`(1 字符，缺省取 name 首字)、`port`、`unit`(systemd)、`container`(docker)、
+  `probe`、`tags`、`hidden`。重复 id 保留第一条并记 `warning`；未知 category 归入「其他」。
+- **探活**：优先级 `probe > container > unit > port(tcp) > 无(unknown)`。
+  `probe` 形如 `{type:"http",target,expect?}` / `{type:"systemd",unit}` / `{type:"docker",container}` / `{type:"tcp",port}`。
+  状态：`up`（2xx/3xx 或 expect 命中 / systemd active / docker running / tcp 通）、`auth`（http 401/403）、
+  `degraded`（http 5xx 或超时 / activating|reloading / restarting|paused）、`down`、`unknown`。
+  单条超时 1500ms，全部 `Promise.allSettled` 并行；单条异常只影响该条（`status:"down"`）。
+- **未登记发现**：`ss -ltnp` 取 `127.0.0.1:` 监听行，排除 `ignorePorts` / 已登记 `port` / `docker-proxy`，按端口升序最多 30 条；解析失败返回 `[]`，不影响 `apps`。
+- **审计**：`apps_list` 只记条数 / 耗时 / 失败条数，**不记录登记表里的 `url`**（可能含内网地址）。
 
 ## 认证模型（`AUTH_MODE`）
 
@@ -102,6 +125,7 @@ npm start        # = node src/index.js，监听 3100
 | `ADMIN_CONFIG_PATH` | `../config.json` | 配置文件路径 |
 | `ADMIN_UPLOAD_DIR` | `../uploads` | 上传目录 |
 | `ADMIN_FILE_DIR` | `/root/files/download` | 文件区根目录（admin「文件」Tab；所有路径严格限制在其内） |
+| `ADMIN_APPS_FILE` | `../data/apps.json` | 应用面板登记表路径（admin「应用」Tab；只读消费，不存在不自动生成） |
 | `ADMIN_AUDIT_LOG` | `../audit.log` | 审计日志 |
 | `HERMES_STATE_DB` | `~/.hermes/state.db` | 历史浏览数据源（测试用可覆盖隔离） |
 | `AUTH_CENTER_BASE_URL` | 无默认 | 认证中心基址（转发设备会话 `/api/admin/sessions*` 与 `/api/admin/totp/*` 用）；未配置时相关接口返回 502 |
