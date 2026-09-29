@@ -2,6 +2,7 @@
   "version": 1,
   "updated": "2026-01-01",
   "ignorePorts": [36921, 39565, 39853, 49374],
+  "ignoreProcesses": ["^chrome", "^agent-browser"],
   "categories": [
     { "id": "self", "name": "自研" },
     { "id": "third", "name": "第三方" },

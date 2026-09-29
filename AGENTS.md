@@ -88,7 +88,7 @@ admin「应用」Tab 的后端：一个**只读**面板，把本机应用集中�
   响应字段：`generatedAt / cached / ttlSeconds / registryPath / registryMtime / notice / warning / categories[] / apps[] / discovered[]`。
 - **登记表**：`data/apps.json`（`ADMIN_APPS_FILE` 覆盖，默认 `<repo>/data/apps.json`）。**只读消费，不存在不自动生成**；
   `mtime` 变化即重读（改登记表无需重启）。样例见 `apps.example.json`（占位值）。缺失 → `200 + apps:[] + notice`；解析失败 → `500 + {error}`。
-- **schema**：顶层 `version / updated / ignorePorts / categories[] / apps[]`。
+- **schema**：顶层 `version / updated / ignorePorts[] / ignoreProcesses[] / categories[] / apps[]`。
   `categories[] = {id,name}`；`apps[]` 字段：`id`(唯一，`^[a-z0-9][a-z0-9-]{0,31}$`)、`name`(≤16 字)、`category`、
   `desc`(≤24 字)、`url`、`icon`(1 字符，缺省取 name 首字)、`port`、`unit`(systemd)、`container`(docker)、
   `probe`、`tags`、`hidden`。重复 id 保留第一条并记 `warning`；未知 category 归入「其他」。
@@ -97,7 +97,7 @@ admin「应用」Tab 的后端：一个**只读**面板，把本机应用集中�
   状态：`up`（2xx/3xx 或 expect 命中 / systemd active / docker running / tcp 通）、`auth`（http 401/403）、
   `degraded`（http 5xx 或超时 / activating|reloading / restarting|paused）、`down`、`unknown`。
   单条超时 1500ms，全部 `Promise.allSettled` 并行；单条异常只影响该条（`status:"down"`）。
-- **未登记发现**：`ss -ltnp` 取 `127.0.0.1:` 监听行，排除 `ignorePorts` / 已登记 `port` / `docker-proxy`，按端口升序最多 30 条；解析失败返回 `[]`，不影响 `apps`。
+- **未登记发现**：`ss -ltnp` 取 `127.0.0.1:` 监听行，排除 `ignorePorts` / `ignoreProcesses`（进程名正则，滤掉 chrome、agent-browser 这类端口每次都在变的工具监听）/ 已登记 `port` / `docker-proxy`，按端口升序最多 30 条；解析失败返回 `[]`，不影响 `apps`。
 - **审计**：`apps_list` 只记条数 / 耗时 / 失败条数，**不记录登记表里的 `url`**（可能含内网地址）。
 
 ## 认证模型（`AUTH_MODE`）

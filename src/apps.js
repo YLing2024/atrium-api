@@ -241,8 +241,11 @@ async function probeApp(app, checkTcpPort) {
   return { ...r, probeType: probe.type };
 }
 
-// 未登记发现：ss -ltnp 只取 127.0.0.1 监听行，排除 ignorePorts / 已登记端口 / docker-proxy
-async function collectDiscovered(ignorePorts, occupiedPorts) {
+// 未登记发现：ss -ltnp 只取 127.0.0.1 监听行，排除 ignorePorts / ignoreProcesses /
+// 已登记端口 / docker-proxy（Docker 端口转发，信息与容器条目重复）。
+// ignoreProcesses 是一组对进程名生效的正则（登记表里的可选字段）：用于滤掉常驻工具链
+// 的临时监听（chrome / agent-browser 的调试端口等），它们的端口号每次都变，没法用端口清单排除。
+async function collectDiscovered(ignorePorts, ignoreProcesses, occupiedPorts) {
   try {
     const { stdout } = await execFileAsync('ss', ['-ltnp'], {
       timeout: 3000,
@@ -250,6 +253,14 @@ async function collectDiscovered(ignorePorts, occupiedPorts) {
     });
     const ignore = new Set(ignorePorts.map(Number));
     const occupied = new Set(occupiedPorts.map(Number));
+    const procSkip = [];
+    for (const pattern of ignoreProcesses) {
+      try {
+        procSkip.push(new RegExp(pattern));
+      } catch (e) {
+        // 单个正则写错不影响其它规则
+      }
+    }
     const found = new Map();
     for (const line of String(stdout).split('\n')) {
       if (!line.includes('127.0.0.1:')) continue;
@@ -261,6 +272,7 @@ async function collectDiscovered(ignorePorts, occupiedPorts) {
       const um = line.match(/users:\(\("([^"]+)",pid=\d+/);
       const process = um ? um[1] : null;
       if (process === 'docker-proxy') continue;
+      if (process && procSkip.some((re) => re.test(process))) continue;
       if (!found.has(port)) found.set(port, { port, process, url: null });
     }
     return Array.from(found.values())
@@ -296,6 +308,7 @@ async function collectOnce(checkTcpPort) {
   const declaredCategories = Array.isArray(data.categories) ? data.categories : [];
   const rawApps = Array.isArray(data.apps) ? data.apps : [];
   const ignorePorts = Array.isArray(data.ignorePorts) ? data.ignorePorts : [];
+  const ignoreProcesses = Array.isArray(data.ignoreProcesses) ? data.ignoreProcesses : [];
 
   // 校验 + 去重（重复 id 保留第一条并记 warning）
   const seen = new Set();
@@ -376,7 +389,7 @@ async function collectOnce(checkTcpPort) {
   const occupiedPorts = rawApps
     .map((a) => Number(a && a.port))
     .filter((n) => Number.isFinite(n) && n > 0);
-  const discovered = await collectDiscovered(ignorePorts, occupiedPorts);
+  const discovered = await collectDiscovered(ignorePorts, ignoreProcesses, occupiedPorts);
 
   return {
     generatedAt,
