@@ -13,6 +13,7 @@
  *   auth     http 401 / 403
  *   degraded http 5xx 或超时 / systemd activating|reloading / docker restarting|paused
  *   down     连接被拒 / 解析失败 / systemd 非 active / docker exited|dead
+ *   idle     按需唤醒应用（onDemand:true）当前探活失败 —— 属正常休眠，非故障（不计入宕机）
  *   unknown  没有可用的探活方式
  */
 
@@ -238,6 +239,16 @@ async function probeApp(app, checkTcpPort) {
   else if (probe.type === 'systemd') r = await probeSystemd(probe.unit);
   else if (probe.type === 'docker') r = await probeDocker(probe.container);
   else r = await probeTcp(probe.port, checkTcpPort);
+  // 按需唤醒：平时停着、访问时才起，探活不通属正常 → 归为休眠（不影响其它状态判定）
+  if (app && app.onDemand === true && r.status === 'down') {
+    return {
+      status: 'idle',
+      probeType: probe.type,
+      latencyMs: null,
+      detail: '按需唤醒，当前休眠',
+      error: null
+    };
+  }
   return { ...r, probeType: probe.type };
 }
 
@@ -356,7 +367,10 @@ async function collectOnce(checkTcpPort) {
       category: a.category != null ? String(a.category) : '',
       desc: a.desc != null ? truncate(a.desc, 24) : null,
       url: typeof a.url === 'string' && a.url ? a.url : null,
-      icon: a.icon ? truncate(a.icon, 1) : truncate(a.name || a.id, 1),
+      // icon：图标名（字符串），前端按图标表匹配；缺失/非法 → null（前端回退首字）。原样透传，不截断
+      icon: typeof a.icon === 'string' && a.icon ? a.icon : null,
+      // onDemand：按需唤醒（布尔，缺省 false）。非法类型按 false 处理，不触发 warning
+      onDemand: a.onDemand === true,
       port: Number.isFinite(port) && port > 0 ? port : null,
       tags: Array.isArray(a.tags) ? a.tags.map(String) : [],
       status: pr.status,
