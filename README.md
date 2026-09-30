@@ -29,7 +29,7 @@
 
 ```bash
 npm install
-npm start        # = node src/index.js，默认监听 0.0.0.0:3100
+npm start        # = node src/index.ts，默认监听 0.0.0.0:3100
 ```
 
 无构建、无测试、无 lint；改完重启进程才生效。
@@ -58,7 +58,7 @@ npm start        # = node src/index.js，默认监听 0.0.0.0:3100
 
 ## 部署
 
-systemd 单元 `admin-server.service`，`WorkingDirectory` 指向仓库根，以 `node src/index.js` 启动，单元内设置 `HOST=127.0.0.1`。
+systemd 单元 `admin-server.service`，`WorkingDirectory` 指向仓库根，以 `node src/index.ts` 启动，单元内设置 `HOST=127.0.0.1`。
 
 ```bash
 systemctl restart admin-server

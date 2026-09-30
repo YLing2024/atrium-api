@@ -5,24 +5,131 @@
  *  - REST 接口：登录 / 系统信息 / 上传 / 下载 / 修改密码 / 历史记录浏览（只读）
  */
 
-const fs = require('fs');
-const path = require('path');
-const os = require('os');
-const { exec, execSync } = require('child_process');
-const { promisify } = require('util');
+import type { Request, Response, NextFunction } from 'express';
+import type { Redis as RedisClient } from 'ioredis';
+import type { DatabaseSync as SqliteDatabase } from 'node:sqlite';
+
+const fs = require('fs') as typeof import('fs');
+const path = require('path') as typeof import('path');
+const os = require('os') as typeof import('os');
+const { exec, execSync } = require('child_process') as typeof import('child_process');
+const { promisify } = require('util') as typeof import('util');
 
 const execAsync = promisify(exec);
-const crypto = require('crypto');
-const express = require('express');
-const net = require('net');
-const Redis = require('ioredis');
-const multer = require('multer');
-const { DatabaseSync } = require('node:sqlite');
-const { createTotpAuth } = require('totp-auth');
-const config = require('./config');
-const appsService = require('./apps');
+const crypto = require('crypto') as typeof import('crypto');
+const express = require('express') as typeof import('express');
+const net = require('net') as typeof import('net');
+const Redis = require('ioredis') as { new (url: string): RedisClient };
+const multer = require('multer') as typeof import('multer');
+const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
+const { createTotpAuth } = require('totp-auth') as typeof import('totp-auth');
 
-const PORT = parseInt(process.env.PORT, 10) || 3100;
+// 本地模块（CommonJS，相对导入写全 .ts 扩展名）
+type AdminConfigModule = {
+  get(): {
+    admin_password: string;
+    totp_secret?: string;
+    auth_center_base_url?: string;
+    [key: string]: unknown;
+  };
+  setAdminPassword(password: string): void;
+  setTotpSecret(secret: string): void;
+  getOrCreateJwtSecret(): string;
+  CONFIG_PATH: string;
+};
+const config = require('./config.ts') as AdminConfigModule;
+
+type AppsServiceModule = {
+  createCollector(deps: {
+    checkTcpPort: (port: number, host?: string, timeout?: number) => Promise<boolean>;
+  }): {
+    getPayload(refresh: boolean): Promise<{ apps: Array<{ status: string }>; [key: string]: unknown }>;
+  };
+  readRegistry(): { exists: boolean; data: unknown; mtimeMs: number | null };
+  registryPath(): string;
+  normalizeProbe(app: unknown): unknown;
+};
+const appsService = require('./apps.ts') as AppsServiceModule;
+
+// 本服务注入的登录身份（express Request 扩展，供 authRequired 之后的处理器读取）
+declare global {
+  namespace Express {
+    interface Request {
+      user?: { role: string; name: string; via: string };
+    }
+  }
+}
+
+/* ============ 类型声明（本次 TS 迁移新增，纯类型、零运行时影响） ============ */
+
+// 内存历史采样点（缓冲区与旧 /history 接口的结构，原样 JSON 序列化）
+type HistoryPoint = {
+  ts: number;
+  cpu: number;
+  mem_percent: number;
+  swap_percent: number;
+  psi_mem_avg10: number | null;
+  psi_cpu_avg10: number | null;
+  psi_io_avg10: number | null;
+  net_rx_rate: number;
+  net_tx_rate: number;
+  disk_io_read: number;
+  disk_io_write: number;
+};
+
+// 长期留样写入点：历史点 + 内存绝对量
+type MetricPoint = HistoryPoint & { mem_used: number; mem_total: number };
+
+// 物化聚合档位定义
+type AggDef = {
+  table: string;
+  stepSec: number;
+  retentionSec: number | null;
+  pct: number;
+  label: string;
+};
+
+// 聚合查询行：bucket + 12 个指标 + 样本数
+type AggRow = { bucket: number; sample_count: number } & Record<string, number | null>;
+
+// 通知行（库内原始行，字段名与表结构一致）
+type NotificationRow = {
+  id: number | bigint;
+  ts: number | bigint;
+  level: string;
+  source: string;
+  type?: string | null;
+  title: string;
+  body: string | null;
+  link: string | null;
+  read_at: number | bigint | null;
+};
+
+// 通知接口契约 item（字段名严格固定；dedup_key 不外泄）
+type NotificationItem = {
+  id: number;
+  ts: number;
+  level: string;
+  source: string;
+  type: string;
+  title: string;
+  body: string | null;
+  link: string | null;
+  readAt: number | null;
+};
+
+// 接口令牌元数据（Redis 里的 JSON）
+type ApiTokenMeta = {
+  id: string;
+  name: string;
+  note?: string;
+  createdAt?: number | string;
+  expiresAt?: number | string;
+  lastUsedAt?: number | string;
+  canWrite?: boolean;
+};
+
+const PORT = parseInt(process.env.PORT as string, 10) || 3100;
 const HOST = process.env.HOST || '0.0.0.0';
 // 管理端认证模式：
 //   builtin（默认）—— 自带账号 + 本地会话（开源用户开箱即用；TOTP 登录、Bearer/cookie 会话）
@@ -43,7 +150,7 @@ const FILE_ROOT_READONLY = new Set(['toolchains', 'apps', 'build', 'www', 'files
                                     'nextcloud']);  // 2026-09-29 Nextcloud 数据目录
 try {
   fs.mkdirSync(FILE_DIR, { recursive: true });
-} catch (e) {
+} catch (e: any) {
   console.error('[admin-server] 文件区目录创建失败:', e.message);
 }
 // Hermes 会话数据库（只读浏览历史记录用）；默认取本机 Hermes state.db，可被环境变量覆盖（测试实例隔离）
@@ -59,7 +166,7 @@ const SESSION_TTL = 43200; // 12 小时，每次请求校验通过后滑动续�
 const API_TOKEN_PREFIX = 'api:token:';
 const API_TOKEN_MAX_DAYS = 365;
 
-function sessionKey(token) {
+function sessionKey(token: string): string {
   return SESSION_KEY_PREFIX + token;
 }
 
@@ -69,7 +176,7 @@ const LOGIN_LOCK_SECONDS = 60;
 const loginFails = new Map(); // ip -> { count, lockUntil }
 
 // 检查是否处于锁定状态；锁定过期则顺手清理，返回 { locked, remain? }
-function loginRateCheck(ip) {
+function loginRateCheck(ip: string): { locked: boolean; remain?: number } {
   const rec = loginFails.get(ip);
   if (rec && rec.lockUntil) {
     if (rec.lockUntil > Date.now()) {
@@ -81,7 +188,7 @@ function loginRateCheck(ip) {
 }
 
 // 记录一次失败；累计到上限即触发 60s 锁定，返回当前失败计数
-function loginRateFail(ip) {
+function loginRateFail(ip: string) {
   const rec = loginFails.get(ip) || { count: 0, lockUntil: 0 };
   rec.count += 1;
   if (rec.count >= LOGIN_MAX_FAILS) {
@@ -92,7 +199,7 @@ function loginRateFail(ip) {
 }
 
 // 登录成功清除该 IP 失败记录
-function loginRateClear(ip) {
+function loginRateClear(ip: string): void {
   loginFails.delete(ip);
 }
 
@@ -100,7 +207,7 @@ function loginRateClear(ip) {
 const AUDIT_LOG_FILE =
   process.env.ADMIN_AUDIT_LOG || path.join(__dirname, '..', 'audit.log');
 
-function auditLog(action, ip, ok, detail) {
+function auditLog(action: string, ip: string, ok: unknown, detail?: string): void {
   const line =
     JSON.stringify({
       ts: new Date().toISOString(),
@@ -111,14 +218,14 @@ function auditLog(action, ip, ok, detail) {
     }) + '\n';
   try {
     fs.appendFileSync(AUDIT_LOG_FILE, line);
-  } catch (e) {
+  } catch (e: any) {
     // 审计日志写入失败仅告警，不阻断业务
     console.error('[admin-server] 审计日志写入失败:', e.message);
   }
 }
 
 // 取客户端 IP：优先 req.ip（Express 已处理 X-Forwarded-For），退化为 socket 地址
-function clientIp(req) {
+function clientIp(req: Request): string {
   // nginx 统一注入 X-Real-IP（admin-server 只监听 127.0.0.1，客户端无法伪造）；
   // 不读它的话 req.ip 恒为 127.0.0.1 —— 限流会退化成全局限流、审计日志也丢来源 IP
   const xr = req.headers['x-real-ip'];
@@ -145,24 +252,24 @@ app.use(express.urlencoded({ extended: true }));
 /* ============ 工具函数 ============ */
 
 // SHA-256 后定时安全比较，避免时序攻击
-function sha256(str) {
+function sha256(str: unknown): Buffer {
   return crypto.createHash('sha256').update(String(str)).digest();
 }
 
-function verifyPassword(input, stored) {
+function verifyPassword(input: unknown, stored: unknown): boolean {
   const a = sha256(input);
   const b = sha256(stored);
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
 // 十六进制 sha256（接口令牌 key 用：api:token:<sha256(token)>，只存哈希不存明文）
-function sha256hex(str) {
+function sha256hex(str: unknown): string {
   return crypto.createHash('sha256').update(String(str)).digest('hex');
 }
 
 // 通用 EMA（指数移动平均）平滑：所有 CPU 值统一走此函数，同参数结果一致。
 // prev 为 null/undefined（首次）时直接取 current，避免冷启动跳变
-function ema(prev, current, alpha) {
+function ema(prev: number | null | undefined, current: number, alpha: number): number {
   return prev == null ? current : prev * (1 - alpha) + current * alpha;
 }
 
@@ -182,7 +289,7 @@ const auth = createTotpAuth({
 });
 
 // 手工解析 Cookie 头取指定字段（无 cookie-parser 依赖）
-function readCookie(req, name) {
+function readCookie(req: Request, name: string): string {
   const raw = req.headers.cookie || '';
   for (const part of String(raw).split(';')) {
     const idx = part.indexOf('=');
@@ -193,7 +300,7 @@ function readCookie(req, name) {
 }
 
 // 自带账号会话 token：Authorization: Bearer 优先，其次 HttpOnly cookie admin_session
-function builtinSessionToken(req) {
+function builtinSessionToken(req: Request): string {
   const header = req.headers.authorization || '';
   if (header.startsWith('Bearer ')) {
     const t = header.slice(7).trim();
@@ -203,7 +310,7 @@ function builtinSessionToken(req) {
 }
 
 // 下发自带账号会话 cookie：Path=/; HttpOnly; SameSite=Lax；HTTPS（X-Forwarded-Proto / req.secure）下加 Secure
-function setSessionCookie(req, res, token) {
+function setSessionCookie(req: Request, res: Response, token: string): void {
   const proto = String(req.get('x-forwarded-proto') || '').split(',')[0].trim();
   const secure = proto === 'https' || req.secure;
   const parts = [
@@ -218,7 +325,7 @@ function setSessionCookie(req, res, token) {
 }
 
 // 清除会话 cookie（登出）
-function clearSessionCookie(res) {
+function clearSessionCookie(res: Response): void {
   res.append('Set-Cookie', 'admin_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0');
 }
 
@@ -227,7 +334,7 @@ function clearSessionCookie(res) {
 //             在 Redis 校验 `admin:session:<token>`，命中即通过并滑动续期；**忽略外部 X-Auth-User**（防提权）。
 //   sso     —— 只认前置认证层注入的 `X-Auth-User`（网关会先剥掉客户端伪造的同名头）。
 // 两种情况失败都返回 401 JSON（不 302、不 500）。
-async function authRequired(req, res, next) {
+async function authRequired(req: Request, res: Response, next: NextFunction) {
   if (AUTH_MODE === 'builtin') {
     const token = builtinSessionToken(req);
     if (token) {
@@ -237,7 +344,7 @@ async function authRequired(req, res, next) {
           req.user = { role: 'admin', name: 'admin', via: 'builtin' };
           return next();
         }
-      } catch (e) {
+      } catch (e: any) {
         return res.status(500).json({ error: '会话服务异常' });
       }
     }
@@ -268,7 +375,7 @@ function cpuSample() {
 const MAX_CORES = 8;
 
 // 每核采样状态：保存上一次 /proc/stat 各核累计值，用于两次采样做差（首次无样本时该核返回 0）
-let cpuPerCoreState = null;
+let cpuPerCoreState: Record<number, { total: number; idle: number }> | null = null;
 
 // 每核 CPU 占用：读 /proc/stat 的 cpuN 行，累加 user/nice/system/idle/iowait/irq/softirq/steal，
 // 与上次采样做差按 (Δtotal − Δidle) / Δtotal × 100 计算（内核口径，含内核与 IO 等待时间）。
@@ -293,13 +400,13 @@ function cpuPerCoreSample() {
       let usage = 0;
       const prev = cpuPerCoreState && cpuPerCoreState[c.id];
       const dt = prev ? c.total - prev.total : 0;
-      if (dt > 0) usage = ((dt - (c.idle - prev.idle)) / dt) * 100;
+      if (dt > 0) usage = ((dt - (c.idle - prev!.idle)) / dt) * 100;
       usage = Math.max(0, Math.min(100, usage));
       cores.push({ id: c.id, usage_percent: Math.round(usage * 10) / 10 });
     }
     cpuPerCoreState = {};
     for (const c of cur) cpuPerCoreState[c.id] = c;
-  } catch (e) {
+  } catch (e: any) {
     // /proc/stat 读取失败时返回空数组
     return [];
   }
@@ -342,7 +449,7 @@ function getDisks() {
         percent: parseInt(String(cols[4]).replace('%', ''), 10) || 0
       });
     }
-  } catch (e) {
+  } catch (e: any) {
     // df 失败时返回空数组
   }
 
@@ -377,7 +484,7 @@ function netSample() {
       rx += parseInt(stats[0], 10) || 0;
       tx += parseInt(stats[8], 10) || 0;
     }
-  } catch (e) {
+  } catch (e: any) {
     // /proc/net/dev 读取失败时保留 0
   }
   return { rx, tx };
@@ -400,7 +507,7 @@ function diskioSample() {
       read += parseInt(cols[5], 10) * 512 || 0;
       write += parseInt(cols[9], 10) * 512 || 0;
     }
-  } catch (e) {
+  } catch (e: any) {
     // /proc/diskstats 读取失败时保留 0
   }
   return { read, write };
@@ -416,7 +523,7 @@ function getProcesses() {
       proc.running = parseInt(m[0], 10) || 0;
       proc.total = parseInt(m[1], 10) || 0;
     }
-  } catch (e) {
+  } catch (e: any) {
     // 读取失败时保留 0
   }
   return proc;
@@ -474,7 +581,7 @@ function getDiskIoInfo() {
 // 其中 used = 真实占用（= total − available），不含内核可回收的页缓存/缓冲；
 // 过去用的 total − free 会把页缓存算成已用，导致面板虚高（本机实测 90% vs 真实 71%）。
 function readMeminfo() {
-  let info = {};
+  let info: Record<string, number> = {};
   try {
     if (fs.existsSync('/proc/meminfo')) {
       const text = fs.readFileSync('/proc/meminfo', 'utf-8');
@@ -483,7 +590,7 @@ function readMeminfo() {
         if (m) info[m[1]] = parseInt(m[2], 10) * 1024;
       }
     }
-  } catch (e) {
+  } catch (e: any) {
     info = {};
   }
   const fallbackTotal = os.totalmem();
@@ -521,10 +628,10 @@ function getZram() {
     if (!zramDevs.length) return null;
 
     const comp = zramDevs[0]; // 主压缩设备（zram0）
-    const readInt = (f) => {
+    const readInt = (f: string): number => {
       try {
         return parseInt(fs.readFileSync(`/sys/block/${comp}/${f}`, 'utf-8').trim(), 10) || 0;
-      } catch (e) {
+      } catch (e: any) {
         return 0;
       }
     };
@@ -535,7 +642,7 @@ function getZram() {
         .trim();
       const mm = raw.match(/\[([^\]]+)\]/);
       algorithm = (mm ? mm[1] : raw.trim()) || null;
-    } catch (e) {
+    } catch (e: any) {
       // 读取失败则 algorithm 保持 null
     }
     // mm_stat 的列定义（Linux zram 文档）：orig_data_size compr_data_size mem_used_total mem_limit
@@ -550,7 +657,7 @@ function getZram() {
         compr = parseInt(cols[1], 10) || 0;
         used = parseInt(cols[2], 10) || 0;
       }
-    } catch (e) {
+    } catch (e: any) {
       orig = 0;
       compr = 0;
       used = 0;
@@ -564,18 +671,18 @@ function getZram() {
       comprSize,
       algorithm
     };
-  } catch (e) {
+  } catch (e: any) {
     return null;
   }
 }
 
 // 解析单个 /proc/pressure/<type> 文件（格式：`some avg10=.. avg60=.. avg300=.. total=..` + full 行）。
 // 文件不存在/解析失败（老内核或容器无 PSI）返回 null，不影响主流程。
-function parsePressureFile(type) {
+function parsePressureFile(type: string) {
   try {
     if (!fs.existsSync(`/proc/pressure/${type}`)) return null;
     const text = fs.readFileSync(`/proc/pressure/${type}`, 'utf-8');
-    const res = {};
+    const res: Record<string, { avg10: number; avg60: number; avg300: number; total: number }> = {};
     for (const line of text.split('\n')) {
       const m = line
         .trim()
@@ -589,7 +696,7 @@ function parsePressureFile(type) {
       };
     }
     return res.some && res.full ? res : null;
-  } catch (e) {
+  } catch (e: any) {
     return null;
   }
 }
@@ -642,7 +749,7 @@ async function collectSystem() {
 
 const HISTORY_MAX = 120; // 最多保留 120 个采样点
 const HISTORY_INTERVAL_MS = 5000; // 每 5 秒采样一次
-const historyBuffer = [];
+const historyBuffer: HistoryPoint[] = [];
 
 // 历史数据落盘：多实例共享同一份数据（见 acquireSamplerLock），路由统一读文件返回
 const HISTORY_FILE =
@@ -652,11 +759,11 @@ const HISTORY_FILE =
 const SAMPLER_LOCK_FILE =
   process.env.ADMIN_SAMPLER_LOCK || path.join(os.tmpdir(), 'admin-server-sampler.lock');
 
-function isPidAlive(pid) {
+function isPidAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;
-  } catch (e) {
+  } catch (e: any) {
     return !!(e && e.code === 'EPERM'); // 进程存在但当前用户无权限探测
   }
 }
@@ -673,7 +780,7 @@ function acquireSamplerLock() {
     }
     fs.writeFileSync(SAMPLER_LOCK_FILE, String(process.pid));
     return true;
-  } catch (e) {
+  } catch (e: any) {
     return false;
   }
 }
@@ -684,7 +791,7 @@ function persistHistory() {
     const tmp = HISTORY_FILE + '.tmp';
     fs.writeFileSync(tmp, JSON.stringify(historyBuffer));
     fs.renameSync(tmp, HISTORY_FILE);
-  } catch (e) {
+  } catch (e: any) {
     // 落盘失败不影响内存 buffer
   }
 }
@@ -695,7 +802,7 @@ function readHistory() {
     const raw = fs.readFileSync(HISTORY_FILE, 'utf-8');
     const arr = JSON.parse(raw);
     if (Array.isArray(arr)) return arr.slice(-HISTORY_MAX);
-  } catch (e) {
+  } catch (e: any) {
     // 文件尚未生成/不可读：退回内存 buffer
   }
   return historyBuffer.slice(-HISTORY_MAX);
@@ -733,7 +840,7 @@ const METRIC_KEYS = [
 // 分档口径（用户 2026-09-18 定稿）：分钟 = Max（峰值）、小时 = P90、天 = P99。
 // 三者一律从 raw 5s 样本直接计算，严禁由细粒度桶递归聚合；调整口径只改这里的 pct。
 // pct = 100 时取桶内最大值（等价 Max）；其余为最近秩分位 ceil(pct/100 * N)。
-const AGG_TABLES = {
+const AGG_TABLES: Record<string, AggDef> = {
   '1m': { table: 'metrics_1m', stepSec: 60, retentionSec: METRICS_1M_RETENTION_SECONDS, pct: 100, label: 'max' },
   '1h': { table: 'metrics_1h', stepSec: 3600, retentionSec: null, pct: 90, label: 'p90' },
   '1d': { table: 'metrics_1d', stepSec: 86400, retentionSec: null, pct: 99, label: 'p99' }
@@ -741,7 +848,7 @@ const AGG_TABLES = {
 const AGG_TABLE_LIST = Object.values(AGG_TABLES);
 
 // 物化值的小数位：与旧 AVG 查询保持一致，前端展示不变
-const METRIC_ROUND = {
+const METRIC_ROUND: Record<string, number> = {
   cpu: 1,
   mem_percent: 1,
   mem_used: 0,
@@ -760,7 +867,7 @@ const AGG_COLUMNS_CREATE = METRIC_KEYS.map((k) => `${k} REAL`).join(', ');
 
 // 可写打开 node:sqlite（懒加载 + 单例）。打开/建表失败只降级为「无长期留样」，
 // 绝不抛出到调用方，避免影响内存采样与 SSE。
-let metricsDb = null;
+let metricsDb: SqliteDatabase | null = null;
 function openMetricsDb() {
   if (metricsDb) return metricsDb;
   try {
@@ -772,7 +879,7 @@ function openMetricsDb() {
       db.exec('PRAGMA journal_mode=WAL');
       db.exec('PRAGMA busy_timeout=8000');
       db.exec('PRAGMA synchronous=NORMAL');
-    } catch (e) {
+    } catch (e: any) {
       console.warn('[admin-server] metrics.db PRAGMA 设置失败（继续运行）:', e.message);
     }
     db.exec(
@@ -795,7 +902,7 @@ function openMetricsDb() {
       );
     }
     metricsDb = db;
-  } catch (e) {
+  } catch (e: any) {
     console.warn('[admin-server] metrics.db 打开失败，长期留样停用:', e.message);
     metricsDb = null;
   }
@@ -804,7 +911,7 @@ function openMetricsDb() {
 
 // 写入一个 raw 采样点（ts 用 epoch 秒）。任何异常只 warn，不抛出：
 // 写库失败不能拖累现有 SSE 与内存采样。
-function persistMetricPoint(point) {
+function persistMetricPoint(point: MetricPoint): void {
   const db = openMetricsDb();
   if (!db) return;
   try {
@@ -833,14 +940,14 @@ function persistMetricPoint(point) {
     db.prepare('DELETE FROM metrics WHERE ts < ?').run(
       Math.floor(Date.now() / 1000) - METRICS_RETENTION_SECONDS
     );
-  } catch (e) {
+  } catch (e: any) {
     console.warn('[admin-server] metrics.db 写入失败:', e.message);
   }
 }
 
 // 粒度/区间白名单：未知参数回退默认（range=1d & step=1m），并正常返回 200
-const METRICS_STEP_SECONDS = { '1m': 60, '5m': 300, '1h': 3600, '1d': 86400 };
-const METRICS_RANGE_SECONDS = {
+const METRICS_STEP_SECONDS: Record<string, number> = { '1m': 60, '5m': 300, '1h': 3600, '1d': 86400 };
+const METRICS_RANGE_SECONDS: Record<string, number> = {
   '1h': 3600,
   '6h': 6 * 3600,
   '1d': 86400,
@@ -852,7 +959,7 @@ const METRICS_RANGE_SECONDS = {
 // 取「最近秩」第 ceil(pct/100 * N) 个样本（整数除法实现）；pct=100 即桶内最大值（Max）。
 // 分钟桶 pct=100、小时桶 pct=90、天桶 pct=99 —— 三者全部直接来自 raw，绝不递归。
 // 返回 [{bucket, sample_count, <metrics>}]。
-function computeAggRows(stepSec, pct, sinceSec, untilSec) {
+function computeAggRows(stepSec: number, pct: number, sinceSec: number, untilSec: number): AggRow[] {
   const db = openMetricsDb();
   if (!db) return [];
   const rank = `(${pct} * cnt + 99) / 100`;
@@ -870,12 +977,12 @@ function computeAggRows(stepSec, pct, sinceSec, untilSec) {
       'SELECT bucket, COUNT(*) OVER (PARTITION BY bucket) AS cnt, ' + rowNums + ', ' + AGG_COLUMNS + ' ' +
       'FROM base' +
     ') SELECT bucket, MAX(cnt) AS sample_count, ' + p99 + ' FROM ranked GROUP BY bucket ORDER BY bucket';
-  return db.prepare(sql).all(stepSec, stepSec, sinceSec, untilSec);
+  return db.prepare(sql).all(stepSec, stepSec, sinceSec, untilSec) as AggRow[];
 }
 
 // 物化表 upsert（INSERT OR REPLACE，幂等：已存在的桶覆盖更新）
-const aggStmtCache = new Map();
-function aggUpsertStmt(db, table) {
+const aggStmtCache = new Map<string, ReturnType<SqliteDatabase['prepare']>>();
+function aggUpsertStmt(db: SqliteDatabase, table: string) {
   let stmt = aggStmtCache.get(table);
   if (stmt) return stmt;
   const placeholders = ['?', ...METRIC_KEYS.map(() => '?'), '?', '?'].join(', ');
@@ -888,7 +995,7 @@ function aggUpsertStmt(db, table) {
 }
 
 // 计算并写入 [sinceSec, untilSec) 内的完整桶（必须与 step 对齐）
-function materializeRange(key, sinceSec, untilSec) {
+function materializeRange(key: string, sinceSec: number, untilSec: number): number {
   const def = AGG_TABLES[key];
   if (!def || untilSec <= sinceSec) return 0;
   const rows = computeAggRows(def.stepSec, def.pct, sinceSec, untilSec);
@@ -905,7 +1012,7 @@ function materializeRange(key, sinceSec, untilSec) {
 
 // 补算「最近 N 个完整桶」（默认 1 个）。周期性任务回看多个桶实现自愈：
 // 幂等 upsert，重复计算代价极低；某次失败留下的空洞会在下一次回看时自动补上。
-function aggregateLastComplete(key, lookback = 1) {
+function aggregateLastComplete(key: string, lookback = 1): number {
   const def = AGG_TABLES[key];
   const nowSec = Math.floor(Date.now() / 1000);
   const end = Math.floor(nowSec / def.stepSec) * def.stepSec; // 当前桶起点 = 完整桶上界（不含）
@@ -920,18 +1027,19 @@ function cleanupExpiredAggregates() {
   const db = openMetricsDb();
   if (!db) return;
   db.prepare('DELETE FROM ' + def.table + ' WHERE bucket_start < ?').run(
-    Math.floor(Date.now() / 1000) - def.retentionSec
+    Math.floor(Date.now() / 1000) - (def.retentionSec as number)
   );
 }
 
 // 启动补齐规划：只挑「raw 有数据但聚合表缺失」的桶，按连续区间分片；
 // 已有的桶一律跳过，绝不在启动时全表重算。
 const BACKFILL_CHUNK_BUCKETS = 512;
-function planBackfillJobs() {
-  const jobs = [];
+type BackfillJob = { key: string; start: number; end: number };
+function planBackfillJobs(): BackfillJob[] {
+  const jobs: BackfillJob[] = [];
   const db = openMetricsDb();
   if (!db) return jobs;
-  const raw = db.prepare('SELECT MIN(ts) mn FROM metrics').get();
+  const raw = db.prepare('SELECT MIN(ts) mn FROM metrics').get() as { mn: number | null } | undefined;
   if (!raw || raw.mn == null) return jobs;
   const nowSec = Math.floor(Date.now() / 1000);
   for (const [key, def] of Object.entries(AGG_TABLES)) {
@@ -940,9 +1048,9 @@ function planBackfillJobs() {
       const floorStart = Math.floor(raw.mn / def.stepSec) * def.stepSec;
       if (floorStart >= end) continue;
       const have = new Set(
-        db
+        (db
           .prepare('SELECT bucket_start FROM ' + def.table + ' WHERE bucket_start >= ? AND bucket_start < ?')
-          .all(floorStart, end)
+          .all(floorStart, end) as { bucket_start: number }[])
           .map((r) => r.bucket_start)
       );
       const rawBuckets = db
@@ -950,34 +1058,34 @@ function planBackfillJobs() {
           'SELECT DISTINCT CAST(ts / ? AS INTEGER) * ? AS b FROM metrics ' +
             'WHERE ts >= ? AND ts < ? ORDER BY b'
         )
-        .all(def.stepSec, def.stepSec, floorStart, end);
-      const ranges = [];
-      let rangeStart = null;
-      let prev = null;
+        .all(def.stepSec, def.stepSec, floorStart, end) as { b: number }[];
+      const ranges: Array<[number, number]> = [];
+      let rangeStart: number | null = null;
+      let prev: number | null = null;
       for (const r of rawBuckets) {
         const b = r.b;
         if (have.has(b)) {
           if (rangeStart != null) {
-            ranges.push([rangeStart, prev]);
+            ranges.push([rangeStart, prev!]);
             rangeStart = null;
           }
           continue;
         }
         if (rangeStart == null) rangeStart = b;
-        else if (b !== prev + def.stepSec) {
-          ranges.push([rangeStart, prev]);
+        else if (b !== prev! + def.stepSec) {
+          ranges.push([rangeStart, prev!]);
           rangeStart = b;
         }
         prev = b;
       }
-      if (rangeStart != null) ranges.push([rangeStart, prev]);
+      if (rangeStart != null) ranges.push([rangeStart, prev!]);
       const chunk = def.stepSec * BACKFILL_CHUNK_BUCKETS;
       for (const [rs, re] of ranges) {
         for (let s = rs; s <= re; s += chunk) {
           jobs.push({ key, start: s, end: Math.min(re + def.stepSec, s + chunk) });
         }
       }
-    } catch (e) {
+    } catch (e: any) {
       console.warn('[admin-server] 聚合补算规划失败(' + key + '):', e.message);
     }
   }
@@ -985,7 +1093,7 @@ function planBackfillJobs() {
 }
 
 // 分片执行补算：每片之间 setImmediate 让出事件循环，避免长时间阻塞采样/SSE
-function runBackfill(jobs, idx) {
+function runBackfill(jobs: BackfillJob[], idx: number): void {
   if (idx >= jobs.length) {
     if (jobs.length) console.log('[admin-server] 聚合启动补算完成，共 ' + jobs.length + ' 个分片');
     return;
@@ -993,7 +1101,7 @@ function runBackfill(jobs, idx) {
   const job = jobs[idx];
   try {
     materializeRange(job.key, job.start, job.end);
-  } catch (e) {
+  } catch (e: any) {
     console.warn('[admin-server] 聚合补算失败(' + job.key + '):', e.message);
   }
   setImmediate(() => runBackfill(jobs, idx + 1));
@@ -1010,7 +1118,7 @@ function startAggregationScheduler() {
   setTimeout(() => {
     try {
       runBackfill(planBackfillJobs(), 0);
-    } catch (e) {
+    } catch (e: any) {
       console.warn('[admin-server] 聚合启动补算失败，不影响采样/SSE:', e.message);
     }
   }, 1500).unref?.();
@@ -1018,21 +1126,21 @@ function startAggregationScheduler() {
     try {
       aggregateLastComplete('1m', 10); // 回看 10 个分钟桶：单次失败留下的空洞下次自动补上
       cleanupExpiredAggregates();
-    } catch (e) {
+    } catch (e: any) {
       console.warn('[admin-server] 分钟桶聚合失败，不影响采样/SSE:', e.message);
     }
   }, 60 * 1000).unref?.();
   setInterval(() => {
     try {
       aggregateLastComplete('1h', 3); // 回看 3 个小时桶
-    } catch (e) {
+    } catch (e: any) {
       console.warn('[admin-server] 小时桶聚合失败，不影响采样/SSE:', e.message);
     }
   }, 60 * 60 * 1000).unref?.();
   setInterval(() => {
     try {
       aggregateLastComplete('1d', 2); // 回看 2 个天桶
-    } catch (e) {
+    } catch (e: any) {
       console.warn('[admin-server] 天桶聚合失败，不影响采样/SSE:', e.message);
     }
   }, 24 * 60 * 60 * 1000).unref?.();
@@ -1040,29 +1148,29 @@ function startAggregationScheduler() {
 
 // 粒度查询：1m/1h/1d 读对应物化聚合表；5m 未物化，退回查询时对 raw 现算 P99（兼容旧参数）。
 // points 与旧 /history 同构；无数据返回空数组 + 完整 meta，绝不抛 500、绝不返回 null。
-function queryMetricPoints(range, step) {
+function queryMetricPoints(range: string, step: string) {
   const stepSec = METRICS_STEP_SECONDS[step];
   const rangeSec = METRICS_RANGE_SECONDS[range];
   const nowSec = Math.floor(Date.now() / 1000);
   const since = nowSec - rangeSec;
   const db = openMetricsDb();
-  const meta = { step, range, bucketCount: 0, firstBucket: null, lastBucket: null, recordedSeconds: 0 };
+  const meta: { step: string; range: string; bucketCount: number; firstBucket: number | null; lastBucket: number | null; recordedSeconds: number } = { step, range, bucketCount: 0, firstBucket: null, lastBucket: null, recordedSeconds: 0 };
   if (!db) return { points: [], meta };
   const def = AGG_TABLES[step];
-  const rows = def
+  const rows = (def
     ? db
         .prepare(
           'SELECT bucket_start AS bucket, ' + AGG_COLUMNS + ' FROM ' + def.table +
             ' WHERE bucket_start >= ? ORDER BY bucket_start'
         )
         .all(since)
-    : computeAggRows(stepSec, 95, since, nowSec + 1); // 未物化的档位（如 5m）现算，口径取 P95
+    : computeAggRows(stepSec, 95, since, nowSec + 1)) as AggRow[]; // 未物化的档位（如 5m）现算，口径取 P95
   const points = rows.map((r) => {
-    const p = { ts: r.bucket * 1000 };
+    const p: { ts: number } & Record<string, number | null> = { ts: r.bucket * 1000 };
     for (const k of METRIC_KEYS) p[k] = r[k];
     return p;
   });
-  const raw = db.prepare('SELECT MIN(ts) mn FROM metrics').get();
+  const raw = db.prepare('SELECT MIN(ts) mn FROM metrics').get() as { mn: number | null } | undefined;
   if (raw && raw.mn != null) meta.recordedSeconds = Math.max(0, nowSec - raw.mn);
   meta.bucketCount = points.length;
   meta.firstBucket = points.length ? points[0].ts : null;
@@ -1071,10 +1179,10 @@ function queryMetricPoints(range, step) {
 }
 
 // 采样器自身的上一次原始采样（用于计算两次采样之间的差值速率/使用率）
-let histCpuPrev = null
-let histCpuEma = null // history CPU 滑动平均;
-let histNetPrev = null;
-let histDiskioPrev = null;
+let histCpuPrev: { ts: number; idle: number; total: number } | null = null
+let histCpuEma: number | null = null // history CPU 滑动平均;
+let histNetPrev: { ts: number; rx: number; tx: number } | null = null;
+let histDiskioPrev: { ts: number; read: number; write: number } | null = null;
 
 const CPU_EMA_ALPHA = 0.4; // 统一 EMA 平滑系数：系统卡片 / 进程排行 / 历史趋势全走同一函数同一参数
 
@@ -1083,7 +1191,7 @@ const CPU_EMA_ALPHA = 0.4; // 统一 EMA 平滑系数：系统卡片 / 进程排
 function memPercent() {
   try {
     const text = fs.readFileSync('/proc/meminfo', 'utf-8');
-    const kv = {};
+    const kv: Record<string, number> = {};
     for (const line of text.split('\n')) {
       const m = line.match(/^(\w+):\s+(\d+)\s*kB/);
       if (m) kv[m[1]] = parseInt(m[2], 10) * 1024;
@@ -1091,7 +1199,7 @@ function memPercent() {
     if (kv.MemTotal > 0 && kv.MemAvailable != null) {
       return Math.round(((kv.MemTotal - kv.MemAvailable) / kv.MemTotal) * 1000) / 10;
     }
-  } catch (e) {
+  } catch (e: any) {
     // /proc/meminfo 不可读时走下面回退
   }
   const total = os.totalmem();
@@ -1103,7 +1211,7 @@ function memPercent() {
 // 解析失败或总 swap 为 0 返回 0，不影响历史采样
 function swapPercent() {
   try {
-    const info = {};
+    const info: Record<string, number> = {};
     const text = fs.readFileSync('/proc/meminfo', 'utf-8');
     for (const line of text.split('\n')) {
       const m = line.match(/^(\w+):\s+(\d+)\s*kB/);
@@ -1113,7 +1221,7 @@ function swapPercent() {
     const free = info.SwapFree != null ? info.SwapFree : 0;
     if (total <= 0) return 0;
     return Math.round(((total - free) / total) * 1000) / 10;
-  } catch (e) {
+  } catch (e: any) {
     return 0;
   }
 }
@@ -1121,7 +1229,7 @@ function swapPercent() {
 // PSI 历史取值：memory/cpu/io 的 some avg10（percent，native 已是滑动均值）
 function psiHistPoint() {
   const p = readPressure();
-  const avg = (o) => (o && o.some && Number.isFinite(o.some.avg10) ? o.some.avg10 : null);
+  const avg = (o: Record<string, { avg10: number }> | null) => (o && o.some && Number.isFinite(o.some.avg10) ? o.some.avg10 : null);
   return { psi_mem_avg10: avg(p.memory), psi_cpu_avg10: avg(p.cpu), psi_io_avg10: avg(p.io) };
 }
 
@@ -1191,7 +1299,7 @@ if (acquireSamplerLock()) {
   process.on('exit', () => {
     try {
       fs.unlinkSync(SAMPLER_LOCK_FILE);
-    } catch (e) {
+    } catch (e: any) {
       // 忽略清理失败
     }
   });
@@ -1213,7 +1321,7 @@ const NOTIFICATIONS_HEARTBEAT_MS = 25000; // SSE 心跳 25s（需求区间 20~30
 const NOTIFICATION_LEVELS = new Set(['urgent', 'normal', 'digest']);
 
 // 可写打开 node:sqlite（懒加载 + 单例）。打开/建表失败只降级，绝不抛到调用方。
-let notificationsDb = null;
+let notificationsDb: SqliteDatabase | null = null;
 function openNotificationsDb() {
   if (notificationsDb) return notificationsDb;
   try {
@@ -1224,7 +1332,7 @@ function openNotificationsDb() {
       db.exec('PRAGMA journal_mode=WAL');
       db.exec('PRAGMA busy_timeout=8000');
       db.exec('PRAGMA synchronous=NORMAL');
-    } catch (e) {
+    } catch (e: any) {
       console.warn('[admin-server] notifications.db PRAGMA 设置失败（继续运行）:', e.message);
     }
     db.exec(
@@ -1278,7 +1386,7 @@ function openNotificationsDb() {
     seedType.run('hermes', 'Hermes', 'normal', 40);
     seedType.run('admin', '管理后台', 'normal', 50);
     notificationsDb = db;
-  } catch (e) {
+  } catch (e: any) {
     console.warn('[admin-server] notifications.db 打开失败，通知中心停用:', e.message);
     notificationsDb = null;
   }
@@ -1287,7 +1395,7 @@ function openNotificationsDb() {
 
 // 库内行 → 接口契约 item（字段名严格固定；dedup_key 不外泄）
 // type 为类别维度（可历史缺失，回退 source），source 字段保留不变，既有客户端不受影响。
-function notificationView(row) {
+function notificationView(row: NotificationRow): NotificationItem {
   return {
     id: Number(row.id),
     ts: Number(row.ts),
@@ -1303,25 +1411,25 @@ function notificationView(row) {
 
 // 未注册类别自动注册：key 当 label、enabled=1。任何新写入方第一次发通知就自动出现在筛选器里。
 // 失败只 warn，绝不阻断写入（注册表出问题也不能丢通知）。
-function ensureNotificationType(db, key) {
+function ensureNotificationType(db: SqliteDatabase, key: string): void {
   if (!key) return;
   try {
     db.prepare(
       'INSERT OR IGNORE INTO notification_types (key, label, description, default_level, sort, enabled, archived_at) ' +
         'VALUES (?, ?, NULL, NULL, 0, 1, NULL)'
     ).run(key, key);
-  } catch (e) {
+  } catch (e: any) {
     console.warn('[admin-server] 通知类别自动注册失败（不影响写入）:', e.message);
   }
 }
 
 // 取类别默认级别：default_level 合法才用，否则 normal（写入方显式给级别时不走这里）。
-function notificationDefaultLevel(db, key) {
+function notificationDefaultLevel(db: SqliteDatabase, key: string): string {
   try {
-    const row = db.prepare('SELECT default_level FROM notification_types WHERE key = ?').get(key);
+    const row = db.prepare('SELECT default_level FROM notification_types WHERE key = ?').get(key) as { default_level: string | null } | undefined;
     const lvl = row && row.default_level;
-    return NOTIFICATION_LEVELS.has(lvl) ? lvl : 'normal';
-  } catch (e) {
+    return NOTIFICATION_LEVELS.has(lvl as string) ? (lvl as string) : 'normal';
+  } catch (e: any) {
     return 'normal';
   }
 }
@@ -1333,7 +1441,7 @@ function cleanupNotifications() {
   try {
     const cutoff = Math.floor(Date.now() / 1000) - NOTIFICATIONS_RETENTION_SECONDS;
     db.prepare('DELETE FROM notifications WHERE ts < ?').run(cutoff);
-  } catch (e) {
+  } catch (e: any) {
     console.warn('[admin-server] 通知清理失败（不影响其它接口）:', e.message);
   }
 }
@@ -1347,14 +1455,14 @@ function startNotificationMaintenance() {
 startNotificationMaintenance();
 
 // SSE 订阅者集合：新通知入库后立即广播；连接断开必须移除（不泄漏监听器）
-const notificationClients = new Set();
+const notificationClients = new Set<Response>();
 
-function broadcastNotification(item) {
+function broadcastNotification(item: NotificationItem): void {
   const frame = 'event: notification\ndata: ' + JSON.stringify(item) + '\n\n';
   for (const res of notificationClients) {
     try {
       res.write(frame);
-    } catch (e) {
+    } catch (e: any) {
       notificationClients.delete(res);
     }
   }
@@ -1364,7 +1472,7 @@ function broadcastNotification(item) {
 // 注意 admin-server 只监听 127.0.0.1，经 nginx 反代的请求 socket 也是回环，
 // 但 nginx 必然注入 X-Real-IP / X-Forwarded-For；据此把它们继续交给 authRequired，
 // 避免把写入接口做成事实上的完全公开。
-function isDirectLoopback(req) {
+function isDirectLoopback(req: Request): boolean {
   const addr = ((req.socket && req.socket.remoteAddress) || '').replace(/^::ffff:/, '');
   if (addr !== '127.0.0.1' && addr !== '::1') return false;
   if (req.headers['x-real-ip'] || req.headers['x-forwarded-for']) return false;
@@ -1373,7 +1481,7 @@ function isDirectLoopback(req) {
 
 // 从请求中提取 API 令牌明文：Authorization: Bearer 优先，兼容 X-Quotahub-Token 与 ?token=
 // （仅用于通知写入等独立令牌通道；/api/admin/* 主鉴权只认网关注入的 X-Auth-User）
-function requestApiToken(req) {
+function requestApiToken(req: Request): string | null {
   const header = req.headers.authorization || '';
   if (header.startsWith('Bearer ')) {
     const t = header.slice(7).trim();
@@ -1385,7 +1493,7 @@ function requestApiToken(req) {
   return queryToken && queryToken.trim() ? queryToken.trim() : null;
 }
 
-async function notificationsWriteAuth(req, res, next) {
+async function notificationsWriteAuth(req: Request, res: Response, next: NextFunction) {
   if (isDirectLoopback(req)) return next();
   // 显式识别「本次请求是否用 API Token」：经网关的请求带 X-Auth-User，authRequired 会走
   // 「信任头部」路径、req.user 无 via/canWrite，只读令牌会绕过闸门，故这里独立查令牌表。
@@ -1394,7 +1502,7 @@ async function notificationsWriteAuth(req, res, next) {
     let meta;
     try {
       meta = await lookupApiTokenMeta(token);
-    } catch (e) {
+    } catch (e: any) {
       return res.status(500).json({ error: '会话服务异常' });
     }
     if (meta) {
@@ -1422,11 +1530,11 @@ const SERVICE_CHECKS = [
 ];
 
 // 尝试 TCP 连接目标端口，connect 成功即视为 up
-function checkTcpPort(port, host = '127.0.0.1', timeout = 1500) {
-  return new Promise((resolve) => {
+function checkTcpPort(port: number, host = '127.0.0.1', timeout = 1500): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
     const socket = new net.Socket();
     let settled = false;
-    const finish = (ok) => {
+    const finish = (ok: boolean) => {
       if (settled) return;
       settled = true;
       socket.destroy();
@@ -1441,7 +1549,7 @@ function checkTcpPort(port, host = '127.0.0.1', timeout = 1500) {
 }
 
 // 通过 ss -ltnp 反查监听端口的进程 pid（不可用/失败返回 null）
-function pidByPort(port) {
+function pidByPort(port: number): number | null {
   try {
     const out = execSync(
       `ss -ltnp 2>/dev/null | awk '$4 ~ /:${port}$/ {print $6}' | head -1`,
@@ -1449,7 +1557,7 @@ function pidByPort(port) {
     );
     const m = out.match(/pid=(\d+)/);
     return m ? Number(m[1]) : null;
-  } catch (e) {
+  } catch (e: any) {
     return null;
   }
 }
@@ -1474,11 +1582,11 @@ async function collectServices() {
           return { name: svc.name, status: 'down', pid: null };
         }
       }
-      const up = await checkTcpPort(svc.port);
+      const up = await checkTcpPort(svc.port as number);
       return {
         name: svc.name,
         status: up ? 'up' : 'down',
-        pid: up ? pidByPort(svc.port) : null
+        pid: up ? pidByPort(svc.port as number) : null
       };
     })
   );
@@ -1486,7 +1594,7 @@ async function collectServices() {
 }
 
 // 按进程名反查 pid（systemd 服务用）
-function pidByProcessName(name) {
+function pidByProcessName(name: string): number | null {
   try {
     const out = require('child_process')
       .execSync(`pgrep -f "${name}" | head -1`, { timeout: 3000 })
@@ -1551,7 +1659,7 @@ app.post(
       await redis.set(sessionKey(token), token, 'EX', SESSION_TTL);
       setSessionCookie(req, res, token);
       res.json({ token });
-    } catch (e) {
+    } catch (e: any) {
       auditLog('login', ip, false, '会话服务异常');
       res.status(500).json({ error: '会话服务异常' });
     }
@@ -1565,7 +1673,7 @@ app.post('/api/admin/logout', async (req, res) => {
   if (token) {
     try {
       await redis.del(sessionKey(token));
-    } catch (e) {
+    } catch (e: any) {
       // 登出幂等：Redis 异常也不阻断，cookie 照清
     }
   }
@@ -1583,7 +1691,7 @@ app.get(
   },
   authRequired,
   (req, res) => {
-    res.json({ name: req.user.name, role: req.user.role });
+    res.json({ name: req.user!.name, role: req.user!.role });
   }
 );
 
@@ -1609,8 +1717,8 @@ function readInternalToken() {
 // （浏览器通道无 token；App 通道带的是 JWT access_token，认证中心 SSO 会话都认不出，会 401）。
 // 两阶段语义（reset 只写 pending → confirm 验证转正）由认证中心内部实现，此处仅透传。
 // 认证中心不可达 → 502；内部令牌文件缺失/为空 → 500（日志写明原因），绝不静默成功。
-function forwardTotp(action) {
-  return async (req, res) => {
+function forwardTotp(action: string) {
+  return async (req: Request, res: Response) => {
     const ip = clientIp(req);
     const sub = String((req.user && req.user.name) || req.get('x-auth-user') || '').trim();
     if (!sub) {
@@ -1626,7 +1734,7 @@ function forwardTotp(action) {
     let internalToken;
     try {
       internalToken = readInternalToken();
-    } catch (e) {
+    } catch (e: any) {
       auditLog('totp_' + action, ip, false, '内部令牌文件不可读');
       console.error(
         `[admin-server] 读取认证中心内部令牌失败（${AUTH_CENTER_INTERNAL_TOKEN_FILE}）: ${e.message}`
@@ -1655,7 +1763,7 @@ function forwardTotp(action) {
       const data = await upstream.json().catch(() => ({}));
       auditLog('totp_' + action, ip, upstream.ok, '内部接口');
       return res.status(upstream.status).json(data);
-    } catch (e) {
+    } catch (e: any) {
       auditLog('totp_' + action, ip, false, '认证中心不可达: ' + e.message);
       return res.status(502).json({ error: '认证中心不可达' });
     }
@@ -1669,7 +1777,7 @@ app.post('/api/admin/totp/confirm', authRequired, forwardTotp('confirm'));
 // 用共享内部令牌（X-Internal-Token）调用认证中心内部接口 /api/internal/sessions*，
 // **不再转发任何客户端凭证**（浏览器无 token；App 带的是 JWT access_token，认证中心 SSO 会话认不出）。
 // GET 列表 / PUT :id/name 重命名 / DELETE :id 踢下线，路径与语义与旧转发一致。
-function forwardSessions(req, res) {
+function forwardSessions(req: Request, res: Response) {
   const ip = clientIp(req);
   const action =
     req.method === 'GET' ? 'list' : req.method === 'PUT' ? 'rename' : req.method === 'DELETE' ? 'delete' : req.method.toLowerCase();
@@ -1683,7 +1791,7 @@ function forwardSessions(req, res) {
   let internalToken;
   try {
     internalToken = readInternalToken();
-  } catch (e) {
+  } catch (e: any) {
     auditLog('sessions_' + action, ip, false, '内部令牌文件不可读');
     console.error(
       `[admin-server] 读取认证中心内部令牌失败（${AUTH_CENTER_INTERNAL_TOKEN_FILE}）: ${e.message}`
@@ -1699,8 +1807,8 @@ function forwardSessions(req, res) {
   const relPath = req.path === '/' ? '' : req.path;
   const url = new URL(base + '/api/internal/sessions' + relPath);
   url.searchParams.set('sub', String(sub));
-  const headers = { Accept: 'application/json', 'X-Internal-Token': internalToken };
-  const opts = { method: req.method, headers, signal: AbortSignal.timeout(5000) };
+  const headers: Record<string, string> = { Accept: 'application/json', 'X-Internal-Token': internalToken };
+  const opts: RequestInit = { method: req.method, headers, signal: AbortSignal.timeout(5000) };
   if (req.method !== 'GET' && req.method !== 'HEAD') {
     headers['Content-Type'] = 'application/json';
     opts.body = JSON.stringify(req.body || {});
@@ -1721,18 +1829,18 @@ app.use('/api/admin/sessions', authRequired, forwardSessions);
 
 /* ============ 接口令牌管理（API Token，与登录设备会话完全隔离） ============ */
 
-function apiTokenKey(id) {
+function apiTokenKey(id: string): string {
   return API_TOKEN_PREFIX + id;
 }
 
 // 解析 api:token: 值的 JSON；返回 null 表示数据异常
-function parseApiTokenMeta(raw) {
+function parseApiTokenMeta(raw: string | null): ApiTokenMeta | null {
   if (!raw) return null;
   try {
     const meta = JSON.parse(raw);
     if (!meta || typeof meta.id !== 'string' || typeof meta.name !== 'string') return null;
     return meta;
-  } catch (e) {
+  } catch (e: any) {
     return null;
   }
 }
@@ -1740,7 +1848,7 @@ function parseApiTokenMeta(raw) {
 // 按明文 token 查 API 令牌表：命中返回 meta，未命中/数据异常返回 null。
 // authRequired 的降级分支与 notificationsWriteAuth 的 canWrite 闸门共用此函数（唯一比对入口）。
 // 注意：不在此吞掉 Redis 异常，交由各自调用方 try/catch 决定 500 还是 401。
-async function lookupApiTokenMeta(token) {
+async function lookupApiTokenMeta(token: string | null): Promise<ApiTokenMeta | null> {
   if (!token) return null;
   const raw = await redis.get(API_TOKEN_PREFIX + sha256hex(token));
   const meta = parseApiTokenMeta(raw);
@@ -1771,7 +1879,7 @@ app.get('/api/admin/api-tokens', authRequired, async (req, res) => {
     tokens.sort((a, b) => b.createdAt - a.createdAt);
     auditLog('api_tokens_list', ip, true, `count=${tokens.length}`);
     return res.json({ tokens });
-  } catch (e) {
+  } catch (e: any) {
     auditLog('api_tokens_list', ip, false, e.message);
     return res.status(500).json({ error: '获取接口令牌失败' });
   }
@@ -1801,7 +1909,7 @@ app.post('/api/admin/api-tokens', authRequired, async (req, res) => {
     await redis.set(apiTokenKey(id), JSON.stringify(meta), 'EX', days * 86400); // 固定过期，不滑动
     auditLog('api_tokens_create', ip, true, `id=${id} name=${name} days=${days} canWrite=${canWrite}`);
     return res.json({ id, token, meta });
-  } catch (e) {
+  } catch (e: any) {
     auditLog('api_tokens_create', ip, false, e.message);
     return res.status(500).json({ error: '生成接口令牌失败' });
   }
@@ -1843,7 +1951,7 @@ app.patch('/api/admin/api-tokens/:id', authRequired, async (req, res) => {
       lastUsedAt: Number(meta.lastUsedAt),
       canWrite: meta.canWrite === true
     });
-  } catch (e) {
+  } catch (e: any) {
     auditLog('api_tokens_update', ip, false, e.message);
     return res.status(500).json({ error: '更新接口令牌失败' });
   }
@@ -1857,7 +1965,7 @@ app.delete('/api/admin/api-tokens/:id', authRequired, async (req, res) => {
     await redis.del(apiTokenKey(id));
     auditLog('api_tokens_delete', ip, true, `id=${id}`);
     return res.json({ ok: true });
-  } catch (e) {
+  } catch (e: any) {
     auditLog('api_tokens_delete', ip, false, e.message);
     return res.status(500).json({ error: '吊销接口令牌失败' });
   }
@@ -1875,7 +1983,7 @@ app.use('/api/admin/totp', (req, res, next) => {
     }
   });
   next();
-}, auth.router);
+}, auth.router!);
 
 // 组装系统信息（REST 端点与 SSE 快照共用）：实时采集系统信息，
 // 请求驱动同步写入历史 buffer，保证趋势图与上方实时数据同源
@@ -1899,7 +2007,7 @@ async function buildServicesPayload() {
 app.get('/api/admin/system', authRequired, async (req, res) => {
   try {
     res.json(await buildSystemPayload());
-  } catch (e) {
+  } catch (e: any) {
     res.status(500).json({ error: '获取系统信息失败: ' + e.message });
   }
 });
@@ -1914,15 +2022,15 @@ app.get('/api/admin/system/history', authRequired, (req, res) => {
 // points 与旧 /history 同构；额外返回 meta。未知 range/step 回退默认（1d/1m）并返回 200；
 // 无数据/单点也返回结构完整的 200（points 可为空、可为单点），绝不 500。
 app.get('/api/admin/system/metrics', authRequired, (req, res) => {
-  const range = METRICS_RANGE_SECONDS[req.query.range] ? String(req.query.range) : '1d';
-  const step = METRICS_STEP_SECONDS[req.query.step] ? String(req.query.step) : '1m';
-  let points = [];
-  let meta = { step, range, bucketCount: 0, firstBucket: null, lastBucket: null, recordedSeconds: 0 };
+  const range = METRICS_RANGE_SECONDS[req.query.range as string] ? String(req.query.range) : '1d';
+  const step = METRICS_STEP_SECONDS[req.query.step as string] ? String(req.query.step) : '1m';
+  let points: ReturnType<typeof queryMetricPoints>['points'] = [];
+  let meta: ReturnType<typeof queryMetricPoints>['meta'] = { step, range, bucketCount: 0, firstBucket: null, lastBucket: null, recordedSeconds: 0 };
   try {
     const r = queryMetricPoints(range, step);
     points = r.points;
     meta = r.meta;
-  } catch (e) {
+  } catch (e: any) {
     // 查询失败不 500：降级为空数组 + 完整 meta，前端保持上一帧，不影响页面其余部分
     console.warn('[admin-server] metrics 查询失败:', e.message);
   }
@@ -1960,7 +2068,7 @@ app.get('/api/admin/system/stream', authRequired, (req, res) => {
       tick += 1;
       // 每 10 tick（约 30s）补一条注释行，防代理超时
       if (tick % 10 === 0) res.write(': ping\n\n');
-    } catch (e) {
+    } catch (e: any) {
       // 单次采集失败不中断流，下个 tick 重试
     } finally {
       pushing = false;
@@ -2012,13 +2120,13 @@ app.post('/api/admin/notifications', notificationsWriteAuth, (req, res) => {
         .prepare(
           'SELECT id FROM notifications WHERE dedup_key = ? AND ts >= ? ORDER BY id DESC LIMIT 1'
         )
-        .get(dedupKey, now - NOTIFICATIONS_DEDUP_WINDOW_SECONDS);
+        .get(dedupKey, now - NOTIFICATIONS_DEDUP_WINDOW_SECONDS) as { id: number } | undefined;
       if (existing) {
         db.prepare(
           'UPDATE notifications SET ts=?, level=?, source=?, type=?, title=?, body=?, link=?, read_at=NULL WHERE id=?'
         ).run(now, level, source, typeKey, title, body, link, existing.id);
         const item = notificationView(
-          db.prepare('SELECT * FROM notifications WHERE id = ?').get(existing.id)
+          db.prepare('SELECT * FROM notifications WHERE id = ?').get(existing.id) as NotificationRow
         );
         broadcastNotification(item);
         auditLog(
@@ -2036,11 +2144,11 @@ app.post('/api/admin/notifications', notificationsWriteAuth, (req, res) => {
       )
       .run(now, level, source, typeKey, title, body, link, dedupKey);
     const id = Number(info.lastInsertRowid);
-    const item = notificationView(db.prepare('SELECT * FROM notifications WHERE id = ?').get(id));
+    const item = notificationView(db.prepare('SELECT * FROM notifications WHERE id = ?').get(id) as NotificationRow);
     broadcastNotification(item);
     auditLog('notification_write', ip, true, `id=${id} level=${level} source=${source} type=${typeKey}`);
     return res.status(201).json({ id, ts: now });
-  } catch (e) {
+  } catch (e: any) {
     auditLog('notification_write', ip, false, e.message);
     return res.status(500).json({ error: '写入通知失败' });
   }
@@ -2052,9 +2160,9 @@ app.get('/api/admin/notifications', authRequired, (req, res) => {
   const db = openNotificationsDb();
   if (!db) return res.status(503).json({ error: '通知库暂不可用' });
   try {
-    const limitRaw = parseInt(req.query.limit, 10);
+    const limitRaw = parseInt(req.query.limit as string, 10);
     const limit = Number.isFinite(limitRaw) ? Math.min(200, Math.max(1, limitRaw)) : 50;
-    const beforeRaw = parseInt(req.query.before, 10);
+    const beforeRaw = parseInt(req.query.before as string, 10);
     const before = Number.isFinite(beforeRaw) ? beforeRaw : null;
     const level = NOTIFICATION_LEVELS.has(String(req.query.level || ''))
       ? String(req.query.level)
@@ -2088,13 +2196,13 @@ app.get('/api/admin/notifications', authRequired, (req, res) => {
       (where.length ? ' WHERE ' + where.join(' AND ') : '') +
       ' ORDER BY id DESC LIMIT ?';
     args.push(limit);
-    const items = db.prepare(sql).all(...args).map(notificationView);
+    const items = (db.prepare(sql).all(...args) as NotificationRow[]).map(notificationView);
     const unread = Number(
-      db.prepare('SELECT COUNT(*) AS n FROM notifications WHERE read_at IS NULL').get().n
+      (db.prepare('SELECT COUNT(*) AS n FROM notifications WHERE read_at IS NULL').get() as { n: number }).n
     );
-    const total = Number(db.prepare('SELECT COUNT(*) AS n FROM notifications').get().n);
+    const total = Number((db.prepare('SELECT COUNT(*) AS n FROM notifications').get() as { n: number }).n);
     res.json({ items, unread, total });
-  } catch (e) {
+  } catch (e: any) {
     res.status(500).json({ error: '获取通知失败' });
   }
 });
@@ -2125,7 +2233,7 @@ app.get('/api/admin/notifications/types', authRequired, (req, res) => {
       unread: Number(r.unread) || 0
     }));
     res.json({ types });
-  } catch (e) {
+  } catch (e: any) {
     res.status(500).json({ error: '获取通知类别失败' });
   }
 });
@@ -2177,7 +2285,7 @@ app.patch('/api/admin/notifications/types/:key', authRequired, (req, res) => {
     if (Number(info.changes) === 0) return res.status(404).json({ error: '类别不存在' });
     auditLog('notification_type_update', clientIp(req), true, `key=${key} fields=${sets.length}`);
     res.json({ ok: true });
-  } catch (e) {
+  } catch (e: any) {
     return res.status(500).json({ error: '修改通知类别失败' });
   }
 });
@@ -2195,7 +2303,7 @@ app.post('/api/admin/notifications/:id/read', authRequired, (req, res) => {
     );
     auditLog('notification_read', clientIp(req), true, `id=${id}`);
     res.json({ ok: true });
-  } catch (e) {
+  } catch (e: any) {
     res.status(500).json({ error: '标记已读失败' });
   }
 });
@@ -2211,7 +2319,7 @@ app.post('/api/admin/notifications/read-all', authRequired, (req, res) => {
     const count = Number(info.changes);
     auditLog('notification_read_all', clientIp(req), true, `count=${count}`);
     res.json({ ok: true, count });
-  } catch (e) {
+  } catch (e: any) {
     res.status(500).json({ error: '全部已读失败' });
   }
 });
@@ -2226,7 +2334,7 @@ app.delete('/api/admin/notifications/:id', authRequired, (req, res) => {
     db.prepare('DELETE FROM notifications WHERE id = ?').run(id);
     auditLog('notification_delete', clientIp(req), true, `id=${id}`);
     res.json({ ok: true });
-  } catch (e) {
+  } catch (e: any) {
     res.status(500).json({ error: '删除通知失败' });
   }
 });
@@ -2262,7 +2370,7 @@ app.post('/api/admin/notifications/bulk-delete', authRequired, (req, res) => {
   try {
     let count;
     if (dryRun) {
-      count = Number(db.prepare('SELECT COUNT(*) AS n FROM notifications' + whereSql).get(...args).n);
+      count = Number((db.prepare('SELECT COUNT(*) AS n FROM notifications' + whereSql).get(...args) as { n: number }).n);
     } else {
       const info = db.prepare('DELETE FROM notifications' + whereSql).run(...args);
       count = Number(info.changes);
@@ -2274,7 +2382,7 @@ app.post('/api/admin/notifications/bulk-delete', authRequired, (req, res) => {
       );
     }
     res.json({ ok: true, count });
-  } catch (e) {
+  } catch (e: any) {
     auditLog('notification_bulk_delete', clientIp(req), false, e.message);
     res.status(500).json({ error: '批量删除失败' });
   }
@@ -2286,9 +2394,9 @@ app.get('/api/admin/notifications/stats', authRequired, (req, res) => {
   const db = openNotificationsDb();
   if (!db) return res.status(503).json({ error: '通知库暂不可用' });
   try {
-    const total = Number(db.prepare('SELECT COUNT(*) AS n FROM notifications').get().n);
+    const total = Number((db.prepare('SELECT COUNT(*) AS n FROM notifications').get() as { n: number }).n);
     const unread = Number(
-      db.prepare('SELECT COUNT(*) AS n FROM notifications WHERE read_at IS NULL').get().n
+      (db.prepare('SELECT COUNT(*) AS n FROM notifications WHERE read_at IS NULL').get() as { n: number }).n
     );
     const sources = db
       .prepare(
@@ -2297,7 +2405,7 @@ app.get('/api/admin/notifications/stats', authRequired, (req, res) => {
       .all()
       .map((r) => ({ source: r.source, count: Number(r.count) }));
     res.json({ total, unread, sources });
-  } catch (e) {
+  } catch (e: any) {
     res.status(500).json({ error: '获取通知统计失败' });
   }
 });
@@ -2320,7 +2428,7 @@ app.get('/api/admin/notifications/stream', authRequired, (req, res) => {
   const hb = setInterval(() => {
     try {
       res.write('event: heartbeat\ndata: ' + JSON.stringify({ ts: Math.floor(Date.now() / 1000) }) + '\n\n');
-    } catch (e) {
+    } catch (e: any) {
       notificationClients.delete(res);
     }
   }, NOTIFICATIONS_HEARTBEAT_MS);
@@ -2338,7 +2446,7 @@ const NODE_BIN = '/root/.nvm/versions/node/v24.19.0/bin';
 
 // 版本清洗：去 v/V 前缀、去开头的 epoch（形如 '5:8.0.2-3+deb13u2'，仅当最前为数字+冒号）、
 // 取第一个 '-' 前的主版本段。例：'5:8.0.2-3+deb13u2' → '8.0.2'；'v24.19.0' → '24.19.0'
-function stripVersion(v) {
+function stripVersion(v: unknown): string {
   return String(v || '')
     .trim()
     .replace(/^[vV]/, '')
@@ -2365,8 +2473,9 @@ const VERSION_CHECKS = [
 
 // 版本结果缓存：1 秒轮询若每次都执行 VERSION_CHECKS 会堆积重命令进程，
 // 故缓存 60 秒，命中窗口内直接返回上次结果，不再重复执行命令
+type VersionItem = { name: string; category: string; version: string; ok: boolean };
 const VERSION_CACHE_TTL_MS = 60000;
-const versionCache = { ts: 0, list: null };
+const versionCache: { ts: number; list: VersionItem[] | null } = { ts: 0, list: null };
 
 // 并行执行所有本地当前版本命令（Promise.allSettled，单条失败不影响其余），
 // 结果统一过 stripVersion 清洗（去 v 前缀、去 epoch、取 '-' 前主版本段）
@@ -2399,7 +2508,7 @@ app.get('/api/admin/versions', authRequired, async (req, res) => {
       versionCache.ts = now;
     }
     res.json({ list: versionCache.list });
-  } catch (e) {
+  } catch (e: any) {
     res.status(500).json({ error: '获取软件版本失败: ' + e.message });
   }
 });
@@ -2434,7 +2543,7 @@ const TERM_UNLOCK_MAX_FAILS = 5;
 const TERM_UNLOCK_LOCKOUT_MS = 10 * 60 * 1000; // 连续失败 5 次锁 10 分钟
 const termUnlockState = new Map(); // ip -> { fails, until }
 
-function termPasswordOk(pw) {
+function termPasswordOk(pw: string): boolean {
   try {
     const raw = fs.readFileSync(TERM_PW_FILE, 'utf-8').trim();
     const [algo, salt, hash] = raw.split('$');
@@ -2443,7 +2552,7 @@ function termPasswordOk(pw) {
     const a = Buffer.from(got, 'hex');
     const b = Buffer.from(hash, 'hex');
     return a.length === b.length && crypto.timingSafeEqual(a, b);
-  } catch (e) {
+  } catch (e: any) {
     return false; // 文件缺失/损坏一律拒绝
   }
 }
@@ -2471,7 +2580,7 @@ app.post('/api/admin/term/unlock', authRequired, async (req, res) => {
   const ticket = crypto.randomBytes(32).toString('hex');
   try {
     await redis.set(TERM_TICKET_PREFIX + sha256hex(ticket), '1', 'EX', TERM_TICKET_TTL);
-  } catch (e) {
+  } catch (e: any) {
     return res.status(500).json({ error: '票据存储失败: ' + e.message });
   }
   auditLog('term_unlock_ok', ip, true, '');
@@ -2490,7 +2599,7 @@ app.get('/api/admin/term/verify', async (req, res) => {
     const v = await redis.get(TERM_TICKET_PREFIX + sha256hex(ticket));
     if (!v) return res.status(401).json({ ok: false });
     res.json({ ok: true });
-  } catch (e) {
+  } catch (e: any) {
     res.status(500).json({ ok: false });
   }
 });
@@ -2499,7 +2608,7 @@ app.get('/api/admin/term/verify', async (req, res) => {
 app.get('/api/admin/term/sessions', authRequired, (req, res) => {
   try {
     res.json({ sessions: listTermSessions() });
-  } catch (e) {
+  } catch (e: any) {
     res.status(500).json({ error: '读取终端会话失败: ' + e.message });
   }
 });
@@ -2516,7 +2625,7 @@ app.post('/api/admin/term/sessions/close', authRequired, (req, res) => {
     try {
       execSync(`tmux kill-session -t '${name}' 2>/dev/null || true`, { encoding: 'utf-8' });
       killed.push(name);
-    } catch (e) {
+    } catch (e: any) {
       /* 单个失败不影响整体 */
     }
   }
@@ -2532,7 +2641,7 @@ app.delete('/api/admin/term/sessions/:name', authRequired, (req, res) => {
     execSync(`tmux kill-session -t '${name}' 2>/dev/null || true`, { encoding: 'utf-8' });
     auditLog('term_session_kill', clientIp(req), true, name);
     res.json({ ok: true });
-  } catch (e) {
+  } catch (e: any) {
     res.status(500).json({ error: '关闭终端会话失败: ' + e.message });
   }
 });
@@ -2543,14 +2652,14 @@ app.delete('/api/admin/term/sessions/:name', authRequired, (req, res) => {
 app.get('/api/admin/services', authRequired, async (req, res) => {
   try {
     res.json(await buildServicesPayload());
-  } catch (e) {
+  } catch (e: any) {
     res.status(500).json({ error: '获取服务状态失败: ' + e.message });
   }
 });
 
 /* ============ 应用面板（Apps Panel） ============ */
 
-// 应用登记表 + 探活：只读消费，逻辑见 src/apps.js。
+// 应用登记表 + 探活：只读消费，逻辑见 src/apps.ts。
 // 模块级缓存 TTL 10s + 单飞（并发复用同一 Promise），refresh=1 绕过缓存。
 const appsCollector = appsService.createCollector({ checkTcpPort });
 
@@ -2564,7 +2673,7 @@ app.get('/api/admin/apps', authRequired, async (req, res) => {
     // 审计只记条数 / 耗时 / 失败条数，绝不记录登记表里的 url
     auditLog('apps_list', ip, true, `apps=${payload.apps.length} failed=${failed} ms=${Date.now() - t0}`);
     res.json(payload);
-  } catch (e) {
+  } catch (e: any) {
     auditLog('apps_list', ip, false, `ms=${Date.now() - t0}`);
     res.status(500).json({ error: e.message });
   }
@@ -2586,15 +2695,15 @@ const SYSTEMD_SERVICES = [
 ];
 
 // 模块级进程瞬时 CPU 采样状态：pid -> { cpu, total }（上次 /proc 采样值，单位 clock ticks）
-const procCpuSample = new Map();
+const procCpuSample = new Map<number, { cpu: number; total: number }>();
 
 // 进程 CPU 与总占用 CPU 的 EMA 平滑状态（pid -> 上次平滑值；totalEmaPrev -> 总占用平滑值）
-const procCpuEma = new Map();
-let totalEmaPrev = null;
+const procCpuEma = new Map<number, number>();
+let totalEmaPrev: number | null = null;
 
 // 读 /proc/<pid>/stat，返回进程已用 CPU ticks（utime+stime，字段 14/15）；
 // 进程名可能含空格，取最后一个 ')' 后的字段再按空格分割，字段 3 起偏移 3
-function procCpuTicks(pid) {
+function procCpuTicks(pid: number): number | null {
   try {
     const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf-8');
     const close = stat.lastIndexOf(')');
@@ -2604,7 +2713,7 @@ function procCpuTicks(pid) {
     const utime = parseInt(rest[11], 10) || 0;
     const stime = parseInt(rest[12], 10) || 0;
     return utime + stime;
-  } catch (e) {
+  } catch (e: any) {
     return null; // /proc/<pid> 不存在或读取失败
   }
 }
@@ -2621,7 +2730,7 @@ function procTotalTicks() {
       (parseInt(cols[3], 10) || 0) +
       (parseInt(cols[4], 10) || 0)
     );
-  } catch (e) {
+  } catch (e: any) {
     return null;
   }
 }
@@ -2638,7 +2747,7 @@ function collectAllProcCpu() {
   let names;
   try {
     names = fs.readdirSync('/proc');
-  } catch (e) {
+  } catch (e: any) {
     return { perPid, totalPct: 0 };
   }
   let sumTicks = 0;
@@ -2698,7 +2807,7 @@ async function collectProcesses() {
         });
         const pid = parseInt(stdout.trim(), 10);
         if (pid > 0) pidToService.set(pid, svc);
-      } catch (e) {
+      } catch (e: any) {
         // 单位不存在/查询失败：跳过，该进程走兜底分类
       }
     })
@@ -2790,19 +2899,19 @@ app.post('/api/admin/upload', authRequired, upload.single('file'), (req, res) =>
 // 根目录 = FILE_DIR，所有路径严格限制在其内部；跳过符号链接，防逃逸。
 
 // 还原原始文件名：busboy 按 latin1 解码 Content-Disposition，中文名会变乱码；按 latin1→utf8 还原
-function decodeOriginalName(raw) {
+function decodeOriginalName(raw: unknown): string {
   const name = String(raw || '');
   try {
     const utf8 = Buffer.from(name, 'latin1').toString('utf8');
     if (!utf8.includes('\uFFFD')) return utf8;
-  } catch (e) {
+  } catch (e: any) {
     // 落到下面的原值
   }
   return name;
 }
 
 // 单个文件/目录名：去分隔符与控制字符，拒绝 . / .. / 空
-function sanitizeSegment(raw) {
+function sanitizeSegment(raw: unknown): string {
   const base = path
     .basename(decodeOriginalName(raw))
     .replace(/[\u0000-\u001f\u007f]/g, '')
@@ -2813,7 +2922,7 @@ function sanitizeSegment(raw) {
 }
 
 // 重名不覆盖：notes.7z → notes-2.7z → notes-3.7z
-function uniqueFileName(dir, raw) {
+function uniqueFileName(dir: string, raw: unknown): string {
   const name = sanitizeSegment(raw) || 'unnamed';
   if (!fs.existsSync(path.join(dir, name))) return name;
   const ext = path.extname(name);
@@ -2826,11 +2935,11 @@ function uniqueFileName(dir, raw) {
 }
 
 // 外部传入的相对路径 → FILE_DIR 内的绝对路径；越界/非法返回 null
-function resolveFileRel(rel) {
+function resolveFileRel(rel: unknown): string | null {
   let decoded;
   try {
     decoded = decodeURIComponent(String(rel == null ? '' : rel));
-  } catch (e) {
+  } catch (e: any) {
     return null;
   }
   const full = path.resolve(FILE_DIR, decoded.replace(/^\/+/, ''));
@@ -2841,7 +2950,7 @@ function resolveFileRel(rel) {
 // 判断一个（已经过 resolveFileRel 的）绝对路径是否命中文件区根目录保护名单。
 // 规则：取相对 FILE_DIR 的第一段，命中 FILE_ROOT_PROTECTED 才算保护；根目录自身不受保护。
 // 只匹配根目录这一层——真实路径比较，不做字符串模糊匹配（my-swapfile.txt 不会被误伤）。
-function isProtectedPath(full) {
+function isProtectedPath(full: string): boolean {
   if (full === FILE_DIR) return false;
   const rel = path.relative(FILE_DIR, full);
   if (!rel || rel === '..' || rel.startsWith('..' + path.sep) || path.isAbsolute(rel)) return false;
@@ -2851,7 +2960,7 @@ function isProtectedPath(full) {
 }
 
 // 是否属于「连列表里都不展示」的那一类：只用于列目录过滤，不参与写操作判定
-function isHiddenRootPath(full) {
+function isHiddenRootPath(full: string): boolean {
   if (full === FILE_DIR) return false;
   const rel = path.relative(FILE_DIR, full);
   if (!rel || rel === '..' || rel.startsWith('..' + path.sep) || path.isAbsolute(rel)) return false;
@@ -2859,7 +2968,7 @@ function isHiddenRootPath(full) {
 }
 
 // 绝对路径 → 相对 FILE_DIR 的路径（用 / 分隔）；根目录为 ''
-function relFromFull(full) {
+function relFromFull(full: string): string {
   const rel = path.relative(FILE_DIR, full);
   return rel === '' ? '' : rel.split(path.sep).join('/');
 }
@@ -2867,11 +2976,13 @@ function relFromFull(full) {
 const fileStorage = multer.diskStorage({
   destination: (req, file, cb) => {
     const dir = resolveFileRel(req.query && req.query.path);
+    // @ts-expect-error: multer 运行时以 error 优先（destination 被忽略），允许只传 error
     if (!dir) return cb(new Error('目标路径非法'));
     // 目标目录不存在时按需创建（拖拽文件夹上传时会带上相对路径）
     try {
       fs.mkdirSync(dir, { recursive: true });
-    } catch (e) {
+    } catch (e: any) {
+      // @ts-expect-error: 同上，error 分支只看第一个参数
       return cb(new Error('创建目标目录失败：' + e.message));
     }
     cb(null, dir);
@@ -2902,7 +3013,7 @@ app.post('/api/admin/files/upload', authRequired, (req, res) => {
     if (isProtectedPath(path.resolve(req.file.path))) {
       try {
         fs.rmSync(req.file.path, { force: true });
-      } catch (e) {
+      } catch (e: any) {
         // 清理失败不影响返回
       }
       auditLog('upload', clientIp(req), false, `${req.file.filename}: 受保护路径`);
@@ -2920,7 +3031,7 @@ app.get('/api/admin/files', authRequired, (req, res) => {
   let st;
   try {
     st = fs.lstatSync(dir);
-  } catch (e) {
+  } catch (e: any) {
     return res.status(404).json({ error: '目录不存在' });
   }
   if (!st.isDirectory()) return res.status(400).json({ error: '不是目录' });
@@ -2931,7 +3042,7 @@ app.get('/api/admin/files', authRequired, (req, res) => {
         let s;
         try {
           s = fs.lstatSync(path.join(dir, d.name));
-        } catch (e) {
+        } catch (e: any) {
           return null;
         }
         const isDir = s.isDirectory();
@@ -2946,7 +3057,7 @@ app.get('/api/admin/files', authRequired, (req, res) => {
           mtime: s.mtimeMs
         };
       })
-      .filter(Boolean)
+      .filter((e): e is { name: string; type: string; size: number; mtime: number } => Boolean(e))
       .sort((a, b) => {
         if (a.type !== b.type) return a.type === 'dir' ? -1 : 1;
         return a.name.localeCompare(b.name, 'zh-Hans-CN');
@@ -2954,7 +3065,7 @@ app.get('/api/admin/files', authRequired, (req, res) => {
     const rel = relFromFull(dir);
     const parent = rel === '' ? null : rel.includes('/') ? rel.slice(0, rel.lastIndexOf('/')) : '';
     res.json({ path: rel, parent, entries });
-  } catch (e) {
+  } catch (e: any) {
     res.status(500).json({ error: '读取目录失败：' + e.message });
   }
 });
@@ -2967,7 +3078,7 @@ app.get('/api/admin/files/download', authRequired, (req, res) => {
   let st;
   try {
     st = fs.lstatSync(full);
-  } catch (e) {
+  } catch (e: any) {
     return res.status(404).json({ error: '文件不存在' });
   }
   if (!st.isFile()) return res.status(400).json({ error: '不是普通文件' });
@@ -2986,7 +3097,7 @@ app.post('/api/admin/files/mkdir', authRequired, (req, res) => {
   if (fs.existsSync(target)) return res.status(409).json({ error: '同名已存在' });
   try {
     fs.mkdirSync(target);
-  } catch (e) {
+  } catch (e: any) {
     auditLog('mkdir', clientIp(req), false, `${name}: ${e.message}`);
     return res.status(500).json({ error: '创建失败：' + e.message });
   }
@@ -3010,7 +3121,7 @@ app.post('/api/admin/files/rename', authRequired, (req, res) => {
   if (target !== full && fs.existsSync(target)) return res.status(409).json({ error: '同名已存在' });
   try {
     fs.renameSync(full, target);
-  } catch (e) {
+  } catch (e: any) {
     auditLog('rename', clientIp(req), false, `${relFromFull(full)}: ${e.message}`);
     return res.status(500).json({ error: '重命名失败：' + e.message });
   }
@@ -3026,13 +3137,13 @@ app.delete('/api/admin/files', authRequired, (req, res) => {
   let st;
   try {
     st = fs.lstatSync(full);
-  } catch (e) {
+  } catch (e: any) {
     return res.status(404).json({ error: '文件不存在' });
   }
   const rel = relFromFull(full);
   try {
     fs.rmSync(full, { recursive: st.isDirectory(), force: false });
-  } catch (e) {
+  } catch (e: any) {
     auditLog('delete', clientIp(req), false, `${rel}: ${e.message}`);
     return res.status(500).json({ error: '删除失败：' + e.message });
   }
@@ -3059,37 +3170,52 @@ const SHARE_MAX_TTL_HOURS = 8760; // 365 天
 const SHARE_REVOKED_KEEP_MS = 30 * 24 * 3600 * 1000; // revoked 记录保留 30 天
 const SHARE_EXPIRED_KEEP_MS = 90 * 24 * 3600 * 1000; // expired 记录保留 90 天
 
+// 分享账本记录（data/file-shares.json 数组元素；字段由本模块写入，读取时宽松校验）
+type ShareRecord = {
+  id: string;
+  token: string;
+  relPath: string;
+  size?: number;
+  note?: string;
+  createdAt?: number;
+  expiresAt: number;
+  revokedAt?: number | null;
+  downloads?: number;
+  lastAccessAt?: number | null;
+  lastAccessIp?: string | null;
+};
+
 // 是否永久有效（expiresAt 为哨兵 0）；所有比较/展示统一走此函数，禁止裸写 === 0
-function isPermanentExpiry(expiresAt) {
+function isPermanentExpiry(expiresAt: unknown): boolean {
   return Number(expiresAt) === SHARE_PERMANENT;
 }
 
 // 状态推导（不落盘）：revoked 优先，其次永久，其次按到期时刻判定
-function shareStatus(rec, now) {
+function shareStatus(rec: ShareRecord, now: number): string {
   if (rec && rec.revokedAt) return 'revoked';
   if (isPermanentExpiry(rec && rec.expiresAt)) return 'active';
   return Number(rec && rec.expiresAt) <= now ? 'expired' : 'active';
 }
 
 // 读取账本原始数组：文件不存在视为空，损坏则回退空（不阻断服务）
-function readSharesRaw() {
+function readSharesRaw(): ShareRecord[] {
   try {
     const raw = fs.readFileSync(SHARE_FILE, 'utf-8');
     const arr = JSON.parse(raw);
-    return Array.isArray(arr) ? arr : [];
-  } catch (e) {
+    return Array.isArray(arr) ? (arr as ShareRecord[]) : [];
+  } catch (e: any) {
     return [];
   }
 }
 
 // 原子写账本（临时文件 + rename，避免读端读到半截内容；与 persistHistory 写法一致）
-function writeShares(list) {
+function writeShares(list: ShareRecord[]): void {
   try {
     fs.mkdirSync(path.dirname(SHARE_FILE), { recursive: true });
     const tmp = SHARE_FILE + '.tmp';
     fs.writeFileSync(tmp, JSON.stringify(list, null, 2));
     fs.renameSync(tmp, SHARE_FILE);
-  } catch (e) {
+  } catch (e: any) {
     console.error('[admin-server] 分享账本写入失败:', e.message);
   }
 }
@@ -3115,10 +3241,10 @@ function readShares() {
 }
 
 // 分享基址：环境变量优先；否则 X-Forwarded-Proto + Host 推导（禁止硬编码域名）
-function shareBaseUrl(req) {
+function shareBaseUrl(req: Request): string {
   if (SHARE_BASE_URL) return SHARE_BASE_URL;
   const proto =
-    String((req.headers['x-forwarded-proto'] || '').split(',')[0].trim()) || 'http';
+    String(((req.headers['x-forwarded-proto'] as string) || '').split(',')[0].trim()) || 'http';
   const host =
     String(req.headers['x-forwarded-host'] || req.headers.host || '')
       .split(',')[0]
@@ -3128,14 +3254,14 @@ function shareBaseUrl(req) {
 
 // 分享路径规范化：仅接受 FILE_DIR 内的相对路径（绝对路径 / 越界 / 含 .. 一律拒绝）
 // 创建入参用此函数（内部复用现有 resolveFileRel），账本已存 relPath 用 shareFullFromRel 还原
-function resolveSharePath(raw) {
+function resolveSharePath(raw: unknown): string | null {
   if (typeof raw !== 'string') return null;
   const trimmed = raw.trim();
   if (!trimmed) return null;
   let decoded;
   try {
     decoded = decodeURIComponent(trimmed);
-  } catch (e) {
+  } catch (e: any) {
     return null;
   }
   // 绝对路径（/etc/passwd、C:\...）一律拒绝：文件区路径只允许相对 FILE_DIR
@@ -3147,7 +3273,7 @@ function resolveSharePath(raw) {
 }
 
 // 账本 relPath（不含 URL 编码）→ 绝对路径；越界返回 null（防账本被篡改）
-function shareFullFromRel(rel) {
+function shareFullFromRel(rel: unknown): string | null {
   if (typeof rel !== 'string' || !rel) return null;
   const full = path.resolve(FILE_DIR, rel);
   if (full !== FILE_DIR && !full.startsWith(FILE_DIR + path.sep)) return null;
@@ -3155,20 +3281,20 @@ function shareFullFromRel(rel) {
 }
 
 // lstat 判定：file / dir / other（符号链接等特殊文件）/ missing
-function shareFileInfo(full) {
+function shareFileInfo(full: string | null): { kind: string; size: number } {
   if (!full) return { kind: 'missing', size: 0 };
   try {
     const st = fs.lstatSync(full);
     if (st.isFile()) return { kind: 'file', size: st.size };
     if (st.isDirectory()) return { kind: 'dir', size: 0 };
     return { kind: 'other', size: 0 };
-  } catch (e) {
+  } catch (e: any) {
     return { kind: 'missing', size: 0 };
   }
 }
 
 // 记录 → 列表视图（存储字段 + 计算字段 url / status / remainingMs / fileExists）
-function toShareView(rec, req, now) {
+function toShareView(rec: ShareRecord, req: Request, now: number) {
   const status = shareStatus(rec, now);
   const remainingMs =
     status === 'active'
@@ -3352,7 +3478,7 @@ app.delete('/api/admin/files/shares/:id', authRequired, (req, res) => {
 app.get('/s/:token', (req, res) => {
   const ip = clientIp(req);
   const now = Date.now();
-  const fail = (status, text) => {
+  const fail = (status: number, text: string) => {
     res
       .status(status)
       .type('html')
@@ -3387,7 +3513,7 @@ app.get('/s/:token', (req, res) => {
   rec.lastAccessIp = ip;
   writeShares(list);
   auditLog('share-download', ip, true, rec.relPath);
-  res.download(full, path.basename(full), (err) => {
+  res.download(full as string, path.basename(full as string), (err) => {
     if (err && !res.headersSent) {
       console.error('[admin-server] 分享下载失败:', err.message);
     }
@@ -3437,14 +3563,14 @@ app.post('/api/admin/password', authRequired, async (req, res) => {
     const keys = await redis.keys(SESSION_KEY_PREFIX + '*');
     if (keys.length) await redis.del(...keys);
     res.json({ ok: true, msg: '密码已修改，请重新登录' });
-  } catch (e) {
+  } catch (e: any) {
     auditLog('password', ip, false, '会话服务异常');
     res.status(500).json({ error: '会话服务异常' });
   }
 });
 
 // 全局错误处理（multer 体积超限等）
-app.use((err, req, res, next) => {
+app.use((err: unknown, req: Request, res: Response, next: NextFunction) => {
   if (err instanceof multer.MulterError) {
     const status = err.code === 'LIMIT_FILE_SIZE' ? 413 : 400;
     return res.status(status).json({ error: '文件过大（上限 100MB）' });
@@ -3460,10 +3586,10 @@ app.use((err, req, res, next) => {
 // 数据库不可用仅影响本接口，不影响其它接口与进程启动
 app.get('/api/admin/history', authRequired, (req, res) => {
   const ip = clientIp(req);
-  let db;
+  let db: SqliteDatabase | undefined;
   try {
     db = new DatabaseSync(HERMES_STATE_DB, { readOnly: true });
-  } catch (e) {
+  } catch (e: any) {
     auditLog('history_list', ip, false, '数据库不可用: ' + e.message);
     return res.status(503).json({ error: '历史记录暂不可用' });
   }
@@ -3473,7 +3599,7 @@ app.get('/api/admin/history', authRequired, (req, res) => {
         `SELECT id, title, display_name, started_at, last_activity_at, message_count, session_key
          FROM sessions ORDER BY last_activity_at DESC`
       )
-      .all();
+      .all() as Array<{ id: string; title: string | null; display_name: string | null; started_at: number | null; last_activity_at: number | null; message_count: number }>;
     const sessions = rows.map((r) => {
       const title = r.title || r.display_name || r.id;
       const raw = r.last_activity_at != null ? r.last_activity_at : r.started_at;
@@ -3486,13 +3612,13 @@ app.get('/api/admin/history', authRequired, (req, res) => {
     });
     auditLog('history_list', ip, true, `sessions=${sessions.length}`);
     res.json({ sessions });
-  } catch (e) {
+  } catch (e: any) {
     auditLog('history_list', ip, false, e.message);
     res.status(500).json({ error: '获取历史会话失败' });
   } finally {
     try {
       db.close();
-    } catch (e) {
+    } catch (e: any) {
       // 关闭失败忽略
     }
   }
@@ -3502,17 +3628,17 @@ app.get('/api/admin/history', authRequired, (req, res) => {
 app.get('/api/admin/history/:id', authRequired, (req, res) => {
   const ip = clientIp(req);
   const id = req.params.id;
-  let db;
+  let db: SqliteDatabase | undefined;
   try {
     db = new DatabaseSync(HERMES_STATE_DB, { readOnly: true });
-  } catch (e) {
+  } catch (e: any) {
     auditLog('history_messages', ip, false, '数据库不可用: ' + e.message);
     return res.status(503).json({ error: '历史记录暂不可用' });
   }
   try {
     const session = db
       .prepare(`SELECT id, title, display_name FROM sessions WHERE id = ?`)
-      .get(id);
+      .get(id) as { id: string; title: string | null; display_name: string | null } | undefined;
     if (!session) {
       auditLog('history_messages', ip, false, '会话不存在: ' + id);
       return res.status(404).json({ error: '会话不存在' });
@@ -3522,7 +3648,7 @@ app.get('/api/admin/history/:id', authRequired, (req, res) => {
         `SELECT role, content, timestamp FROM messages
          WHERE session_id = ? AND role IN ('user','assistant') ORDER BY id ASC`
       )
-      .all(id);
+      .all(id) as Array<{ role: string; content: string; timestamp: number | null }>;
     const messages = rows.map((r) => ({
       role: r.role,
       content: r.content,
@@ -3533,13 +3659,13 @@ app.get('/api/admin/history/:id', authRequired, (req, res) => {
       session: { id: session.id, title: session.title || session.display_name || session.id },
       messages
     });
-  } catch (e) {
+  } catch (e: any) {
     auditLog('history_messages', ip, false, e.message);
     res.status(500).json({ error: '获取会话消息失败' });
   } finally {
     try {
       db.close();
-    } catch (e) {
+    } catch (e: any) {
       // 关闭失败忽略
     }
   }

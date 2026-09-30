@@ -29,9 +29,9 @@
 
 ```
 src/
-├── index.js    # 全部路由 + 采样器 + 鉴权中间件（单文件，1600+ 行）
-├── apps.js     # 应用面板：登记表读取 + 探活采集（CommonJS，被 index.js require）
-└── config.js   # config.json 读写（首次运行自动生成，含初始密码）
+├── index.ts    # 全部路由 + 采样器 + 鉴权中间件（单文件，3558 行；TS 化完成，分层拆分另行排期）
+├── apps.ts     # 应用面板：登记表读取 + 探活采集（CommonJS，被 index.ts require）
+└── config.ts   # config.json 读写（首次运行自动生成，含初始密码）
 apps.example.json   # 应用登记表样例（占位值，入库；复制到 data/apps.json 使用）
 config.json         # 本地生成，不入库（.gitignore）
 uploads/            # 上传目录，不入库
@@ -43,7 +43,7 @@ audit.log           # 审计日志，不入库
 
 ```bash
 npm install
-npm start        # = node src/index.js，监听 3100
+npm start        # = node src/index.ts，监听 3100
 ```
 
 **没有测试、没有 lint、没有构建**。改完直接 `npm start` 或 `systemctl restart admin-server` 验证。

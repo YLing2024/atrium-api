@@ -3,9 +3,14 @@
   "version": "1.0.0",
   "private": true,
   "description": "个人网站 Admin 系统后端：认证 / 系统监控 / 文件上传下载 / Hermes WS 桥接",
-  "main": "src/index.js",
+  "main": "src/index.ts",
   "scripts": {
-    "start": "node src/index.js"
+    "start": "node src/index.ts",
+    "check": "tsc --noEmit",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=24.0.0"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
@@ -13,5 +18,11 @@
     "ioredis": "^5.4.1",
     "multer": "^1.4.5-lts.1",
     "totp-auth": "file:../totp-auth"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.25",
+    "@types/multer": "^1.4.13",
+    "@types/node": "^24.19.0",
+    "typescript": "^5.9.3"
   }
 }
