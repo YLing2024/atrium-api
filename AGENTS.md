@@ -122,7 +122,7 @@ admin「应用」Tab 的后端：一个**只读**面板，把本机应用集中�
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `PORT` / `HOST` | `3100` / `127.0.0.1` | systemd 里设置了 `HOST=127.0.0.1` |
+| `PORT` / `HOST` | `3100` / `0.0.0.0`（代码默认） | systemd 单元里设置 `HOST=127.0.0.1`，只监听回环 |
 | `AUTH_MODE` | `builtin` | 认证模式：`builtin`（自带账号 + 登录页）/ `sso`（关掉自带口令，只看 `X-Auth-User`）；非法/未设置按 `builtin` |
 | `ADMIN_CONFIG_PATH` | `../config.json` | 配置文件路径 |
 | `ADMIN_UPLOAD_DIR` | `../uploads` | 上传目录 |
