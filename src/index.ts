@@ -53,6 +53,9 @@ const appsService = require('./apps.ts') as AppsServiceModule;
 
 // 本服务注入的登录身份（express Request 扩展，供 authRequired 之后的处理器读取）
 declare global {
+  // 既有的 express 类型扩展写法：为此命名空间声明式地补充 Request 字段
+  // （ESLint 报告 namespace 写法，但改成模块语法会改变类型扩展语义，故保留）
+  // eslint-disable-next-line @typescript-eslint/no-namespace
   namespace Express {
     interface Request {
       user?: { role: string; name: string; via: string };

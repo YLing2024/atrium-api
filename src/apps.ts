@@ -197,6 +197,29 @@ function normalizeProbe(app: AppEntry): Probe | null {
   return null;
 }
 
+// HTTP 状态码 → 探活状态（纯函数：先看 expect 白名单，再按区间归类）
+function httpStatusFromCode(code: number, expect: number[] | null): ProbeStatus {
+  if (Array.isArray(expect) && expect.includes(code)) return 'up';
+  if (code >= 200 && code < 400) return 'up';
+  if (code === 401 || code === 403) return 'auth';
+  if (code >= 500) return 'degraded';
+  return 'down';
+}
+
+// systemd is-active 输出 → 探活状态（纯函数）
+function systemdStatusFromOutput(out: string): ProbeStatus {
+  if (out === 'active') return 'up';
+  if (out === 'activating' || out === 'reloading') return 'degraded';
+  return 'down';
+}
+
+// docker inspect .State.Status 输出 → 探活状态（纯函数）
+function dockerStatusFromOutput(out: string): ProbeStatus {
+  if (out === 'running') return 'up';
+  if (out === 'restarting' || out === 'paused') return 'degraded';
+  return 'down';
+}
+
 // HTTP 探活：fetch + AbortController(1500ms)，redirect: 'manual'
 async function probeHttp(target: string, expect: number[] | null): Promise<ProbeResult> {
   const start = Date.now();
@@ -210,12 +233,7 @@ async function probeHttp(target: string, expect: number[] | null): Promise<Probe
     });
     const latencyMs = Date.now() - start;
     const code = resp.status;
-    let status: ProbeStatus;
-    if (Array.isArray(expect) && expect.includes(code)) status = 'up';
-    else if (code >= 200 && code < 400) status = 'up';
-    else if (code === 401 || code === 403) status = 'auth';
-    else if (code >= 500) status = 'degraded';
-    else status = 'down';
+    const status = httpStatusFromCode(code, expect);
     return { status, latencyMs, detail: `HTTP ${code}`, error: null };
   } catch (e: any) {
     const latencyMs = Date.now() - start;
@@ -248,10 +266,7 @@ async function probeSystemd(unit: string): Promise<ProbeResult> {
       timeout: PROBE_TIMEOUT_MS
     });
     const out = String(stdout).trim();
-    let status: ProbeStatus;
-    if (out === 'active') status = 'up';
-    else if (out === 'activating' || out === 'reloading') status = 'degraded';
-    else status = 'down';
+    const status = systemdStatusFromOutput(out);
     return { status, latencyMs: Date.now() - start, detail: `systemd ${out}`, error: null };
   } catch (e: any) {
     // is-active 对非 active 单元退出码非 0，stdout 仍可能是 inactive/failed
@@ -278,10 +293,7 @@ async function probeDocker(container: string): Promise<ProbeResult> {
       { timeout: PROBE_TIMEOUT_MS }
     );
     const out = String(stdout).trim();
-    let status: ProbeStatus;
-    if (out === 'running') status = 'up';
-    else if (out === 'restarting' || out === 'paused') status = 'degraded';
-    else status = 'down';
+    const status = dockerStatusFromOutput(out);
     return { status, latencyMs: Date.now() - start, detail: `docker ${out}`, error: null };
   } catch (e: any) {
     // 容器不存在 / docker 不可用 → down
@@ -304,6 +316,29 @@ async function probeTcp(port: number, checkTcpPort: CheckTcpPort): Promise<Probe
     latencyMs,
     detail: `TCP ${port} ${latencyMs}ms`,
     error: up ? null : '连接被拒绝'
+  };
+}
+
+// 登记表条目 + 探活结果 → 接口返回条目（纯函数：字段类型归一化，缺省/异常输入一律兜底）
+function toAppView(a: AppEntry, pr: AppProbeResult): AppView {
+  const port = Number(a.port);
+  return {
+    id: a.id,
+    name: truncate(a.name || a.id, 16),
+    category: a.category != null ? String(a.category) : '',
+    desc: a.desc != null ? truncate(a.desc, 24) : null,
+    url: typeof a.url === 'string' && a.url ? a.url : null,
+    // icon：图标名（字符串），前端按图标表匹配；缺失/非法 → null（前端回退首字）。原样透传，不截断
+    icon: typeof a.icon === 'string' && a.icon ? a.icon : null,
+    // onDemand：按需唤醒（布尔，缺省 false）。非法类型按 false 处理，不触发 warning
+    onDemand: a.onDemand === true,
+    port: Number.isFinite(port) && port > 0 ? port : null,
+    tags: Array.isArray(a.tags) ? a.tags.map(String) : [],
+    status: pr.status,
+    probeType: pr.probeType,
+    latencyMs: pr.latencyMs,
+    detail: pr.detail,
+    error: pr.error || null
   };
 }
 
@@ -340,39 +375,49 @@ async function probeApp(app: AppEntry, checkTcpPort: CheckTcpPort): Promise<AppP
 // 已登记端口 / docker-proxy（Docker 端口转发，信息与容器条目重复）。
 // ignoreProcesses 是一组对进程名生效的正则（登记表里的可选字段）：用于滤掉常驻工具链
 // 的临时监听（chrome / agent-browser 的调试端口等），它们的端口号每次都变，没法用端口清单排除。
+// ss -ltnp 输出 → 未登记发现（纯函数：解析 + 排除 + 去重 + 排序 + 截断）
+function scanDiscovered(
+  stdout: unknown,
+  ignorePorts: unknown[],
+  ignoreProcesses: unknown[],
+  occupiedPorts: unknown[]
+): DiscoveredEntry[] {
+  const ignore = new Set(ignorePorts.map(Number));
+  const occupied = new Set(occupiedPorts.map(Number));
+  const procSkip: RegExp[] = [];
+  for (const pattern of ignoreProcesses) {
+    try {
+      procSkip.push(new RegExp(pattern as string));
+    } catch (e: any) {
+      // 单个正则写错不影响其它规则
+    }
+  }
+  const found = new Map<number, DiscoveredEntry>();
+  for (const line of String(stdout).split('\n')) {
+    if (!line.includes('127.0.0.1:')) continue;
+    const pm = line.match(/127\.0\.0\.1:(\d+)/);
+    if (!pm) continue;
+    const port = Number(pm[1]);
+    if (!Number.isFinite(port)) continue;
+    if (ignore.has(port) || occupied.has(port)) continue;
+    const um = line.match(/users:\(\("([^"]+)",pid=\d+/);
+    const process = um ? um[1] : null;
+    if (process === 'docker-proxy') continue;
+    if (process && procSkip.some((re) => re.test(process))) continue;
+    if (!found.has(port)) found.set(port, { port, process, url: null });
+  }
+  return Array.from(found.values())
+    .sort((a, b) => a.port - b.port)
+    .slice(0, MAX_DISCOVERED);
+}
+
 async function collectDiscovered(ignorePorts: unknown[], ignoreProcesses: unknown[], occupiedPorts: unknown[]): Promise<DiscoveredEntry[]> {
   try {
     const { stdout } = await execFileAsync('ss', ['-ltnp'], {
       timeout: 3000,
       maxBuffer: 1024 * 1024
     });
-    const ignore = new Set(ignorePorts.map(Number));
-    const occupied = new Set(occupiedPorts.map(Number));
-    const procSkip: RegExp[] = [];
-    for (const pattern of ignoreProcesses) {
-      try {
-        procSkip.push(new RegExp(pattern as string));
-      } catch (e: any) {
-        // 单个正则写错不影响其它规则
-      }
-    }
-    const found = new Map<number, DiscoveredEntry>();
-    for (const line of String(stdout).split('\n')) {
-      if (!line.includes('127.0.0.1:')) continue;
-      const pm = line.match(/127\.0\.0\.1:(\d+)/);
-      if (!pm) continue;
-      const port = Number(pm[1]);
-      if (!Number.isFinite(port)) continue;
-      if (ignore.has(port) || occupied.has(port)) continue;
-      const um = line.match(/users:\(\("([^"]+)",pid=\d+/);
-      const process = um ? um[1] : null;
-      if (process === 'docker-proxy') continue;
-      if (process && procSkip.some((re) => re.test(process))) continue;
-      if (!found.has(port)) found.set(port, { port, process, url: null });
-    }
-    return Array.from(found.values())
-      .sort((a, b) => a.port - b.port)
-      .slice(0, MAX_DISCOVERED);
+    return scanDiscovered(stdout, ignorePorts, ignoreProcesses, occupiedPorts);
   } catch (e: any) {
     // 解析失败绝不影响 apps
     return [];
@@ -444,25 +489,7 @@ async function collectOnce(checkTcpPort: CheckTcpPort) {
         error: String((r.reason && r.reason.message) || r.reason)
       };
     }
-    const port = Number(a.port);
-    apps.push({
-      id: a.id,
-      name: truncate(a.name || a.id, 16),
-      category: a.category != null ? String(a.category) : '',
-      desc: a.desc != null ? truncate(a.desc, 24) : null,
-      url: typeof a.url === 'string' && a.url ? a.url : null,
-      // icon：图标名（字符串），前端按图标表匹配；缺失/非法 → null（前端回退首字）。原样透传，不截断
-      icon: typeof a.icon === 'string' && a.icon ? a.icon : null,
-      // onDemand：按需唤醒（布尔，缺省 false）。非法类型按 false 处理，不触发 warning
-      onDemand: a.onDemand === true,
-      port: Number.isFinite(port) && port > 0 ? port : null,
-      tags: Array.isArray(a.tags) ? a.tags.map(String) : [],
-      status: pr.status,
-      probeType: pr.probeType,
-      latencyMs: pr.latencyMs,
-      detail: pr.detail,
-      error: pr.error || null
-    });
+    apps.push(toAppView(a, pr));
   }
 
   // 分类聚合：未知分类归入「其他」（动态补一个 other）
@@ -540,4 +567,15 @@ function createCollector(deps: { checkTcpPort: CheckTcpPort }) {
   return { getPayload };
 }
 
-module.exports = { createCollector, readRegistry, registryPath, normalizeProbe };
+module.exports = {
+  createCollector,
+  readRegistry,
+  registryPath,
+  normalizeProbe,
+  // 以下为纯函数，导出供单元测试（行为未变）
+  scanDiscovered,
+  httpStatusFromCode,
+  systemdStatusFromOutput,
+  dockerStatusFromOutput,
+  toAppView
+};
