@@ -24,6 +24,25 @@ type AdminConfig = {
   [key: string]: unknown;
 };
 
+// 运行时服务参数（启动时由环境变量确定，取值非法/未设置一律回退默认）
+const PORT: number = parseInt(process.env.PORT as string, 10) || 3100;
+const HOST: string = process.env.HOST || '0.0.0.0';
+// 管理端认证模式：builtin（默认，自带账号）/ sso（只看前置认证层注入的 X-Auth-User）
+const AUTH_MODE: 'builtin' | 'sso' =
+  String(process.env.AUTH_MODE || 'builtin').toLowerCase() === 'sso' ? 'sso' : 'builtin';
+
+// 本模块导出形状（供 require 方做类型标注；CJS 的 module.exports 无法用 typeof import 推导）
+export type AdminConfigModule = {
+  get(): AdminConfig;
+  setAdminPassword(password: string): void;
+  setTotpSecret(secret: string): void;
+  getOrCreateJwtSecret(): string;
+  CONFIG_PATH: string;
+  PORT: number;
+  HOST: string;
+  AUTH_MODE: 'builtin' | 'sso';
+};
+
 const DEFAULT_CONFIG = {
   admin_password: crypto.randomBytes(12).toString('base64url') // 首次运行随机生成（仓库不携带任何固定默认口令）
 };
@@ -80,5 +99,8 @@ module.exports = {
     }
     return c.jwt_secret;
   },
-  CONFIG_PATH
+  CONFIG_PATH,
+  PORT,
+  HOST,
+  AUTH_MODE
 };
