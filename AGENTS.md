@@ -20,7 +20,7 @@
 
 ## 技术栈
 
-- Node 24（nvm v24.19.0）+ Express 4，**CommonJS**（`'use strict'`，无 TS、无构建步骤）
+- Node 24（nvm v24.19.0，`.nvmrc` 已钉）+ Express 4，**TypeScript**（CommonJS 语法，Node 直接执行 `.ts`，**无构建步骤**）
 - `ioredis`（会话/票据/限流）、`multer`（上传）、`bcryptjs`
 - `totp-auth` — 通过 `file:../totp-auth`（软链到 `auth-server/lib/totp-auth`）引入，改动它等于改认证中心模块
 - SQLite 用 **Node 内置 `node:sqlite`**（只读打开 Hermes `state.db`，请求内 open→query→close），**没有 better-sqlite3 依赖**
@@ -29,9 +29,29 @@
 
 ```
 src/
-├── index.ts    # 全部路由 + 采样器 + 鉴权中间件（单文件，3558 行；TS 化完成，分层拆分另行排期）
-├── apps.ts     # 应用面板：登记表读取 + 探活采集（CommonJS，被 index.ts require）
-└── config.ts   # config.json 读写（首次运行自动生成，含初始密码）
+├── index.ts            # 入口：依赖装配 + 路由挂载 + 启动（无业务逻辑）
+├── config.ts           # config.json 读写（首次运行自动生成，含初始密码）
+├── db.ts               # SQLite 单例与建表（metrics.db / notifications.db，用 node:sqlite）
+├── state.ts            # Redis 单例与 key 前缀
+├── util.ts             # 通用工具（时间/格式化/HTTP 状态映射等纯函数）
+├── apps.ts             # 应用面板：登记表读取 + 探活采集
+├── middleware/
+│   ├── auth.ts         # 认证中间件（builtin 会话 / sso 网关注入 Header）
+│   └── errors.ts       # 错误处理与 404
+├── probe/              # 探活采集
+│   ├── system.ts       #   系统指标采样
+│   └── services.ts     #   systemd/docker 服务状态
+├── metrics/            # 指标留样与聚合
+│   ├── store.ts        #   写入与留存
+│   ├── proctop.ts      #   进程排行
+│   └── aggregate.ts    #   分钟/小时/天物化桶
+├── notifications/
+│   ├── store.ts        #   通知表读写
+│   └── sse.ts          #   SSE 流
+└── routes/             # 全部 HTTP 路由（每个 router 内部写完整路径，根挂载）
+    ├── system.ts  auth.ts  api-tokens.ts  notifications.ts  versions.ts
+    └── term.ts  apps.ts  files.ts  shares.ts  history.ts
+test/                   # node:test 单测（33 例：探活归一化、状态映射、登记表扫描过滤、聚合口径等）
 apps.example.json   # 应用登记表样例（占位值，入库；复制到 data/apps.json 使用）
 config.json         # 本地生成，不入库（.gitignore）
 uploads/            # 上传目录，不入库
@@ -39,14 +59,17 @@ data/               # 运行时数据（用户配置/日志，可能含密钥）
 audit.log           # 审计日志，不入库
 ```
 
+**新增一层时的规矩**：路由加在对应 `routes/*.ts`（内部写完整路径）；跨层共享的东西放 `util.ts`，别让 `db.ts`/`state.ts` 反向依赖 `routes/`。改动后必须 `npm run check`。
+
 ## 命令
 
 ```bash
 npm install
 npm start        # = node src/index.ts，监听 3100
+npm run check    # typecheck + lint + test（改完代码先跑这个）
 ```
 
-**没有测试、没有 lint、没有构建**。改完直接 `npm start` 或 `systemctl restart admin-server` 验证。
+**无构建步骤**（Node 直接执行 TS）；单测用 Node 内置 `node:test`，ESLint 只开正确性规则。改完再 `systemctl restart admin-server` 验证线上。
 
 ## 主要接口（节选）
 
@@ -145,7 +168,8 @@ admin「应用」Tab 的后端：一个**只读**面板，把本机应用集中�
 
 ## 已知坑
 
-- **单文件大块头**：所有路由都在 `src/index.js`。改动时按注释分区定位，别整体重排（会产生巨大 diff）。
+- **改哪一层去哪个文件**：路由 → `src/routes/<业务线>.ts`（内部写完整路径，`index.ts` 根挂载）；探活 → `src/probe/`；指标留样/聚合 → `src/metrics/`；通知 → `src/notifications/`；中间件 → `src/middleware/`；纯工具 → `src/util.ts`。单文件 3558 行的时代已结束（2026-09-30 拆分），改一处不必再全文件通读——但**别把新逻辑塞回 `index.ts`**，它只做装配。
+- **大重构前先建安全网**：本仓库有一份「全路由快照比对」脚本（49 路由 / 73 变体 / 7 探针，含真 TOTP 登录取真凭证 + 响应归一化 diff），做法见本地项目笔记。重构前后各跑一次，差异必须能逐条解释。⚠️ 抽路由的工具**必须按目录扫 `src/`**（只读 `index.ts` 会漏掉 `routes/*` 里的全部路由，2026-09-30 踩过）。
 - 🔴 **nginx 侧与大文件上传相关的硬约束**（2026-09-14 踩坑，改配置前必读）：
   1. `/api/admin/` 的 `client_max_body_size` 是 **100m**，文件区上传走的是单独加的 `location /api/admin/files/upload`（**512m**）。新增任何接收大 body 的接口，都要确认它落在哪个 location、那个 location 的上限是多少——**nginx 先于应用层拒绝，返回的是 HTML 而不是 JSON**。
   2. ~~`/auth-check` 探针 location 必须显式写 `client_max_body_size 0;`~~ —— **探针已废弃（2026-09-28 改由 Auth Gateway 鉴权），本坑不再适用**。网关自行处理请求体，不再有「子请求不继承父 location 上限」的问题。
@@ -153,7 +177,7 @@ admin「应用」Tab 的后端：一个**只读**面板，把本机应用集中�
 - 历史浏览用 **`node:sqlite` 只读打开**，不要改成可写或长连接持有（Hermes 网关正在写同一个库）。
 - 采样器有 Redis/文件锁（`ADMIN_SAMPLER_LOCK`）防多实例重复采样；测试实例务必改锁与前缀，否则会和线上互相干扰。
 - 无热重载：改完必须重启进程才生效。
-- 这是 **CommonJS**，不要混用 `import` 语法。
+- 这是 **CommonJS**（`require` / `module.exports`）；类型导入用 `import type`（会被原样剥离，不产生运行时 import）。
 
 ## 部署
 

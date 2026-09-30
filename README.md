@@ -32,7 +32,7 @@ npm install
 npm start        # = node src/index.ts，默认监听 0.0.0.0:3100
 ```
 
-无构建、无测试、无 lint；改完重启进程才生效。
+无构建（Node 直接执行 TS）、无外部测试框架（`node:test`）、ESLint 只做正确性检查；改完重启进程才生效。
 
 ## 配置
 
