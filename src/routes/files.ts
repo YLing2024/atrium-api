@@ -37,7 +37,7 @@ const FILE_MAX_BYTES = 500 * 1024 * 1024; // 单文件上限 500MB（与 /api/ad
 // 两者都只作用于根目录这一层：子目录中的同名文件（如 <root>/backup/swapfile）不受影响。
 const FILE_ROOT_PROTECTED = new Set(['swapfile', 'lost+found', 'cache']);
 const FILE_ROOT_READONLY = new Set(['toolchains', 'apps', 'build', 'www', 'files', 'backups', 'siyuan',
-                                    'nextcloud']);  // 2026-09-29 Nextcloud 数据目录
+                                      'nextcloud', 'vaultwarden']);  // 2026-09-29 Nextcloud；2026-10-06 Vaultwarden 密码库
 try {
   fs.mkdirSync(FILE_DIR, { recursive: true });
 } catch (e: any) {
