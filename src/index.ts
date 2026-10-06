@@ -32,6 +32,7 @@ const notificationsRouter = require('./routes/notifications.ts');
 const versionsRouter = require('./routes/versions.ts');
 const termRouter = require('./routes/term.ts');
 const appsRouter = require('./routes/apps.ts');
+const publicAppsRouter = require('./routes/public-apps.ts');
 const filesRouter = require('./routes/files.ts');
 const sharesRouter = require('./routes/shares.ts');
 const historyRouter = require('./routes/history.ts');
@@ -48,6 +49,7 @@ app.use(notificationsRouter); // 通知中心
 app.use(versionsRouter); // 软件版本
 app.use(termRouter); // Web 终端
 app.use(appsRouter); // 应用面板
+app.use(publicAppsRouter); // 公开只读应用中心（/api/public/apps，免鉴权）
 app.use(filesRouter); // 通用上传下载 + 文件区
 app.use(sharesRouter); // 文件区临时链接
 app.use(errorHandler); // 统一错误处理（与原位置一致：files/shares 之后、history 之前）
