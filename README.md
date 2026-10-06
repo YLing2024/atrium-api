@@ -1,10 +1,12 @@
+[简体中文](README.md) ｜ [English](README.en.md)
+
 # atrium-api
 
 个人网站管理后台的接口服务：系统监控、文件、终端、应用与通知。
 
 ## 它能做什么
 
-- **系统状态**：CPU（总体 / 每核）、内存与 swap、磁盘、磁盘 IO、网络速率、PSI 压力、负载、uptime。`/api/admin/system` 实时快照；`/api/admin/system/history` 返回最近 120 个采样点；`/api/admin/system/metrics` 按 `range`（`1m`/`1h`/`1d`）与 `step`（`1m`）读物化聚合桶；`/api/admin/system/stream` 以 SSE 每秒推送。
+- **系统状态**：CPU（总体 / 每核）、内存与 swap、磁盘、磁盘 IO、网络速率、PSI 压力、负载、uptime。`/api/admin/system` 实时快照；`/api/admin/system/history` 返回最近 120 个采样点；`/api/admin/system/metrics` 按 `range`（`1h`/`6h`/`1d`/`7d`/`30d`）与 `step`（`1m`/`5m`/`1h`/`1d`）读物化聚合桶；`/api/admin/system/stream` 以 SSE 每秒推送。
 - **版本与服务**：`/api/admin/versions`（60s 缓存）、`/api/admin/services`（各服务 up/down + 进程 TOP15 与总 CPU）。
 - **文件区**：在 `ADMIN_FILE_DIR` 根下浏览 / 上传（500MB）/ 下载 / 新建 / 重命名 / 删除，并提供限时分享链接（公开入口 `/s/:token`）。另有旧接口 `/api/admin/upload`（100MB）与 `/api/admin/download`。
 - **Web 终端**：终端口令二次验证 → 12 小时票据 → ttyd/tmux 会话列表与关闭。
