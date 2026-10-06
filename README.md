@@ -19,6 +19,7 @@
 
 - 登记表 `data/apps.json`（`ADMIN_APPS_FILE` 覆盖），**只读消费**、不存在不生成；文件 `mtime` 变化即重读。样例见 `apps.example.json`（占位值）。
 - `GET /api/admin/apps`：`?refresh=1` 绕过 10s 缓存；并发请求复用同一次采集。返回 `categories[] / apps[] / discovered[] / notice / warning` 等字段。
+- `GET /api/public/apps`：**公开只读、免鉴权**（独立子域「应用中心」用）。沿用同一采集逻辑与 10s 缓存 / 单飞，但只回公开安全字段：`categories[]`（`{id, name}`）与 `apps[]`（白名单 `id / name / category / desc / url / icon / status / latencyMs / onDemand`），剔除 `port / unit / container / probe / registryPath / registryMtime / notice / warning` 与未登记发现 `discovered[]`。`?refresh=1` 按来源 IP 限流（10s 窗口内至多一次真正刷新，超出按缓存读）；响应头 `Cache-Control: no-store`；后端不可用回 `503`。
 - **多分组**：`categories[] = {id, name}` 定义分组，未知分类归入「其他」。
 - **探活**：优先级 `probe > container > unit > port`；状态 `up` / `auth` / `degraded` / `down` / `idle` / `unknown`。单条超时 1500ms，全部并行，单条失败不影响其它。
 - **按需唤醒**：`onDemand: true` 的应用探活不通时归为 `idle`（休眠），不计入宕机。

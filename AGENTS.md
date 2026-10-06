@@ -85,6 +85,7 @@ npm run check    # typecheck + lint + test（改完代码先跑这个）
 | GET | `/api/admin/versions` | ✅ | 软件版本 |
 | GET | `/api/admin/services` | ✅ | systemd 服务状态 |
 | GET | `/api/admin/apps` | ✅ | 应用面板：登记表全部应用 + 实时探活（`?refresh=1` 绕过 10s 缓存）；只读 |
+| GET | `/api/public/apps` | 无 | 公开只读应用中心：字段白名单 + 10s 缓存单飞；`?refresh=1` 按来源 IP 限流；`Cache-Control: no-store`；失败 503 |
 | POST | `/api/admin/upload` | ✅ | multipart，字段名 `file`（上限 100MB） |
 | GET | `/api/admin/download?path=` | ✅ | 仅限 `uploads/` 内 |
 | GET | `/api/admin/files?path=` | ✅ | 文件区列目录（`{ path, parent, entries[] }`，目录在前） |
@@ -124,6 +125,7 @@ admin「应用」Tab 的后端：一个**只读**面板，把本机应用集中�
   单条超时 1500ms，全部 `Promise.allSettled` 并行；单条异常只影响该条（`status:"down"`）。
 - **未登记发现**：`ss -ltnp` 取 `127.0.0.1:` 监听行，排除 `ignorePorts` / `ignoreProcesses`（进程名正则，滤掉 chrome、agent-browser 这类端口每次都在变的工具监听）/ 已登记 `port` / `docker-proxy`，按端口升序最多 30 条；解析失败返回 `[]`，不影响 `apps`。
 - **审计**：`apps_list` 只记条数 / 耗时 / 失败条数，**不记录登记表里的 `url`**（可能含内网地址）。
+- **公开只读接口**：`GET /api/public/apps`（免鉴权，逻辑在 `src/routes/public-apps.ts`）复用同一 `createCollector` + `checkTcpPort`，但独立缓存实例；只回 `categories[{id,name}]` + `apps[]` 白名单字段，剔除 `port/unit/container/probe/registryPath/registryMtime/notice/warning` 与 `discovered[]`；`?refresh=1` 按来源 IP 每 10s 至多一次真正刷新；响应 `Cache-Control: no-store`；失败 503 通用文案。审计动作为 `public_apps_list`。
 
 ## 认证模型（`AUTH_MODE`）
 
