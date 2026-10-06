@@ -567,11 +567,102 @@ function createCollector(deps: { checkTcpPort: CheckTcpPort }) {
   return { getPayload };
 }
 
+/* ============ 公开只读面板（/api/public/apps）复用逻辑 ============ */
+
+// 公开应用字段白名单：只暴露这些字段，顺序即输出顺序。
+// 白名单外（port / unit / container / probe / tags / probeType / detail / error…）一律不透出。
+const PUBLIC_APP_FIELDS = [
+  'id',
+  'name',
+  'category',
+  'desc',
+  'url',
+  'icon',
+  'status',
+  'latencyMs',
+  'onDemand'
+] as const;
+
+// 公开接口返回的单项应用（字段严格取自白名单）
+type PublicAppView = {
+  id: unknown;
+  name: string;
+  category: string;
+  desc: string | null;
+  url: string | null;
+  icon: string | null;
+  status: ProbeStatus;
+  latencyMs: number | null;
+  onDemand: boolean;
+};
+
+// 单条应用 → 公开字段投影（白名单外全部丢弃）
+function toPublicApp(app: AppView): PublicAppView {
+  return {
+    id: app.id,
+    name: app.name,
+    category: app.category,
+    desc: app.desc,
+    url: app.url,
+    icon: app.icon,
+    status: app.status,
+    latencyMs: app.latencyMs,
+    onDemand: app.onDemand
+  };
+}
+
+// 采集载荷 → 公开响应：只保留 categories[{id,name}] 与 apps[白名单]，
+// 剔除登记表路径 / mtime / notice / warning，以及未登记发现（discovered）等内部信息。
+// 字段名与状态词与 /api/admin/apps 完全一致，只是范围收窄。
+function toPublicPayload(payload: { categories?: unknown; apps?: unknown }): {
+  categories: { id: unknown; name: unknown }[];
+  apps: PublicAppView[];
+} {
+  const cats = Array.isArray(payload.categories) ? payload.categories : [];
+  const apps = Array.isArray(payload.apps) ? payload.apps : [];
+  return {
+    categories: cats
+      .filter((c) => c != null && typeof c === 'object')
+      .map((c) => {
+        const cat = c as CategoryAgg;
+        return { id: cat.id, name: cat.name };
+      }),
+    apps: apps
+      .filter((a) => a != null && typeof a === 'object')
+      .map((a) => toPublicApp(a as AppView))
+  };
+}
+
+/**
+ * 按来源 IP 的刷新限流：同一 key 在 windowMs 窗口内只允许一次返回 true（真正刷新）。
+ * 公开接口用它挡住「refresh=1 打本机」的放大；窗口内再次请求返回 false，调用方按缓存读。
+ */
+function createRefreshLimiter(windowMs: number) {
+  const last = new Map<string, number>();
+  return function allow(key: string, now = Date.now()): boolean {
+    const prev = last.get(key);
+    if (prev !== undefined && now - prev < windowMs) return false;
+    last.set(key, now);
+    // 防 Map 无界增长：超过阈值时清理已过期条目（个人站点访问量下足够）
+    if (last.size > 1000) {
+      for (const [k, t] of last) {
+        if (now - t >= windowMs) last.delete(k);
+      }
+    }
+    return true;
+  };
+}
+
 module.exports = {
   createCollector,
   readRegistry,
   registryPath,
   normalizeProbe,
+  // 公开只读面板复用：字段投影 + 刷新限流
+  PUBLIC_APP_FIELDS,
+  toPublicApp,
+  toPublicPayload,
+  createRefreshLimiter,
   // 以下为纯函数，导出供单元测试（行为未变）
   scanDiscovered,
   httpStatusFromCode,

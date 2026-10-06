@@ -20,7 +20,11 @@ const {
   httpStatusFromCode,
   systemdStatusFromOutput,
   dockerStatusFromOutput,
-  toAppView
+  toAppView,
+  PUBLIC_APP_FIELDS,
+  toPublicApp,
+  toPublicPayload,
+  createRefreshLimiter
 } = require('../src/apps.ts');
 
 // ---------- httpStatusFromCode：状态判定与映射 ----------
@@ -302,4 +306,104 @@ test('readRegistry：非法 JSON 抛错且 message 带固定前缀', () => {
     if (prev === undefined) delete process.env.ADMIN_APPS_FILE;
     else process.env.ADMIN_APPS_FILE = prev;
   }
+});
+
+// ---------- 公开只读面板：字段白名单投影 + 刷新限流 ----------
+
+test('toPublicApp：只输出白名单字段，剔除 port/tags/probeType/detail/error', () => {
+  const pub = toPublicApp({
+    id: 'a',
+    name: 'A',
+    category: 'self',
+    desc: 'd',
+    url: 'https://example.com',
+    icon: 'home',
+    onDemand: true,
+    port: 3100,
+    tags: ['x'],
+    status: 'up',
+    probeType: 'tcp',
+    latencyMs: 3,
+    detail: 'TCP 3100 3ms',
+    error: null
+  });
+  // 键集合与白名单完全一致（多一个少一个都算失败）
+  assert.deepEqual(Object.keys(pub).sort(), [...PUBLIC_APP_FIELDS].sort());
+  assert.deepEqual(pub, {
+    id: 'a',
+    name: 'A',
+    category: 'self',
+    desc: 'd',
+    url: 'https://example.com',
+    icon: 'home',
+    status: 'up',
+    latencyMs: 3,
+    onDemand: true
+  });
+});
+
+test('toPublicApp：idle/onDemand 与状态词原样透传，不因公开而改写', () => {
+  const pub = toPublicApp({
+    id: 'a',
+    name: 'A',
+    category: 'self',
+    desc: null,
+    url: null,
+    icon: null,
+    status: 'idle',
+    latencyMs: null,
+    onDemand: true
+  });
+  assert.equal(pub.status, 'idle');
+  assert.equal(pub.onDemand, true);
+});
+
+test('toPublicPayload：categories 只留 {id,name}，剔除 discovered/registryPath/notice/warning', () => {
+  const pub = toPublicPayload({
+    generatedAt: 'x',
+    registryPath: '/internal/data/apps.json',
+    registryMtime: 123,
+    notice: '未找到应用登记表',
+    warning: '重复 id: a',
+    categories: [{ id: 'self', name: '自研', total: 2, up: 1, down: 1 }],
+    apps: [
+      {
+        id: 'a',
+        name: 'A',
+        category: 'self',
+        desc: null,
+        url: null,
+        icon: null,
+        status: 'down',
+        latencyMs: null,
+        onDemand: false,
+        port: 3100,
+        tags: [],
+        probeType: 'tcp',
+        detail: 'x',
+        error: 'y'
+      }
+    ],
+    discovered: [{ port: 9999, process: 'node', url: null }]
+  });
+
+  assert.deepEqual(Object.keys(pub).sort(), ['apps', 'categories']);
+  assert.deepEqual(pub.categories, [{ id: 'self', name: '自研' }]);
+  assert.equal(pub.apps.length, 1);
+  assert.equal((pub as any).discovered, undefined);
+  assert.equal((pub as any).registryPath, undefined);
+  assert.equal((pub as any).notice, undefined);
+  assert.equal((pub as any).warning, undefined);
+  assert.equal((pub.apps[0] as any).port, undefined);
+});
+
+test('createRefreshLimiter：窗口内仅放行一次，窗口过后重新放行，按 key 独立', () => {
+  const allow = createRefreshLimiter(10000);
+  const t0 = 1_000_000;
+  assert.equal(allow('1.2.3.4', t0), true);
+  assert.equal(allow('1.2.3.4', t0 + 1), false);
+  assert.equal(allow('1.2.3.4', t0 + 9999), false);
+  assert.equal(allow('1.2.3.4', t0 + 10000), true);
+  // 不同来源 IP 互不影响
+  assert.equal(allow('5.6.7.8', t0 + 10001), true);
 });
