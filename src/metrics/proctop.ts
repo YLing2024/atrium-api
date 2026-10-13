@@ -272,7 +272,7 @@ async function collectProcesses(): Promise<{
     ? await collectContainerNames()
     : new Map<string, string>();
 
-  // 5. 截断 + 合计（先用带 rss_kb 的原始行，保证 total_mem_mb 与 ps 实测同口径），
+  // 6. 截断 + 合计（先用带 rss_kb 的原始行，保证 total_mem_mb 与 ps 实测同口径），
   //    再对保留下来的行做命名 + CPU 覆盖 + 子树合计
   const { processes: kept, count, truncated, total_mem_mb } = summarizeProcesses(rows, MAX_PROCESS_ROWS);
   const named: Array<Omit<ProcNode, 'subtree_mem_mb' | 'subtree_cpu'>> = kept.map((r) => ({
