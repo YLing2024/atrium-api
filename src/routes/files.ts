@@ -35,11 +35,16 @@ const FILE_MAX_BYTES = 500 * 1024 * 1024; // 单文件上限 500MB（与 /api/ad
 //  · FILE_ROOT_PROTECTED —— 系统文件，不展示、也不允许任何写操作命中其整棵子树（swapfile / lost+found / cache）
 //  · FILE_ROOT_READONLY  —— 收纳目录，正常展示、可浏览，但「根这一层的那一项」不允许被删/改名/移动，子路径照常读写
 // 两者都只作用于根目录这一层：子目录中的同名文件（如 <root>/backup/swapfile）不受影响。
-const FILE_ROOT_PROTECTED = new Set(['swapfile', 'lost+found', 'cache']);
+const FILE_ROOT_PROTECTED = new Set(['swapfile', 'lost+found', 'cache', 'docker', '.trash-queue']);
 const FILE_ROOT_READONLY = new Set(['toolchains', 'apps', 'build', 'www', 'files', 'backups', 'siyuan',
-                                      'vaultwarden', 'objbox', 'karakeep']);
+                                      'vaultwarden', 'objbox', 'karakeep',
+                                      'davbox', 'memos', 'joplin', 'changedetection', 'sillytavern',
+                                      'aionui', 'redroid', 'sftpgo', 'authgw', 'reminderweb']);
                                       // 2026-09-29 Nextcloud；2026-10-06 Vaultwarden 密码库；2026-10-07 objbox 对象存储
                                       // 2026-10-13 karakeep 书签服务数据（网页归档与检索索引）
+                                      // 2026-10-13 补登记既有服务数据目录：此前它们只靠人记着不许删，
+                                      //            在文件区是「可一键删除」状态（含 davbox 的 WebDAV 数据）
+                                      // docker = Docker data-root（26G），与 cache 同类：隐藏且禁写
                                       // 2026-10-09 Nextcloud / Vikunja / Super Productivity 三个待办相关服务
                                       //            均下线并清数据，对应目录与名单项一并移除
 try {
