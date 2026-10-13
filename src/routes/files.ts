@@ -37,8 +37,11 @@ const FILE_MAX_BYTES = 500 * 1024 * 1024; // 单文件上限 500MB（与 /api/ad
 // 两者都只作用于根目录这一层：子目录中的同名文件（如 <root>/backup/swapfile）不受影响。
 const FILE_ROOT_PROTECTED = new Set(['swapfile', 'lost+found', 'cache']);
 const FILE_ROOT_READONLY = new Set(['toolchains', 'apps', 'build', 'www', 'files', 'backups', 'siyuan',
-                                      'nextcloud', 'vaultwarden', 'objbox']);
+                                      'vaultwarden', 'objbox', 'karakeep']);
                                       // 2026-09-29 Nextcloud；2026-10-06 Vaultwarden 密码库；2026-10-07 objbox 对象存储
+                                      // 2026-10-13 karakeep 书签服务数据（网页归档与检索索引）
+                                      // 2026-10-09 Nextcloud / Vikunja / Super Productivity 三个待办相关服务
+                                      //            均下线并清数据，对应目录与名单项一并移除
 try {
   fs.mkdirSync(FILE_DIR, { recursive: true });
 } catch (e: any) {
