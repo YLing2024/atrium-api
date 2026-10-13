@@ -20,7 +20,13 @@ const { collectServices } = require('../probe/services.ts') as {
   collectServices: () => Promise<Array<{ name: string; status: string; pid: number | null }>>;
 };
 const { collectProcesses } = require('../metrics/proctop.ts') as {
-  collectProcesses: () => Promise<{ processes: unknown[]; total_cpu: number }>;
+  collectProcesses: () => Promise<{
+    processes: unknown[];
+    count: number;
+    truncated: boolean;
+    total_mem_mb: number;
+    total_cpu: number;
+  }>;
 };
 const { sampleHistory, readHistory } = require('../metrics/store.ts') as {
   sampleHistory: () => void;
@@ -50,10 +56,18 @@ async function buildSystemPayload() {
   return data;
 }
 
-// 组装服务状态（REST 端点与 SSE 快照共用）
+// 组装服务状态（REST /api/admin/services 专用）：服务列表 + 全量进程树 +
+// count / truncated / total_mem_mb / total_cpu。SSE 帧不再携带进程明细，见下方 stream 路由。
 async function buildServicesPayload() {
   const [services, result] = await Promise.all([collectServices(), collectProcesses()]);
-  return { services, processes: result.processes, total_cpu: result.total_cpu };
+  return {
+    services,
+    processes: result.processes,
+    count: result.count,
+    truncated: result.truncated,
+    total_mem_mb: result.total_mem_mb,
+    total_cpu: result.total_cpu
+  };
 }
 
 // 系统信息（需鉴权）。每次请求实时采集，无缓存
@@ -104,7 +118,9 @@ router.get('/api/admin/system/stream', authRequired, (req, res) => {
   let tick = 0;
   let pushing = false;
 
-  // 单条 snapshot：system / services / history 一次组装推送；
+  // 单条 snapshot：system / services / history 一次组装推送。
+  // 2026-10-13 起 SSE 不再携带进程明细（321 行 × 1s 会白烧带宽 + 前端每秒重渲染），
+  // 帧结构保持 { system, services: { services, total_cpu }, history }；进程树改由 REST /services 提供。
   // pushing 防抖避免采集慢于推送间隔时 setInterval 重叠堆积
   async function push() {
     if (pushing) return;
@@ -112,11 +128,17 @@ router.get('/api/admin/system/stream', authRequired, (req, res) => {
     try {
       const [system, services, history] = await Promise.all([
         buildSystemPayload(),
-        buildServicesPayload(),
+        collectServices(),
         Promise.resolve(readHistory())
       ]);
+      // total_cpu 语义不变（collectAllProcCpu 的系统总占用）；同帧直接复用 system.cpu.usage_percent
+      // （同一 tick 内只做一次 /proc 差分，避免二次遍历把 EMA 拉偏）
+      const sysCpu = (system as { cpu?: { usage_percent?: number } }).cpu;
+      const total_cpu = sysCpu && typeof sysCpu.usage_percent === 'number' ? sysCpu.usage_percent : 0;
       res.write(
-        'event: snapshot\ndata: ' + JSON.stringify({ system, services, history }) + '\n\n'
+        'event: snapshot\ndata: ' +
+          JSON.stringify({ system, services: { services, total_cpu }, history }) +
+          '\n\n'
       );
       tick += 1;
       // 每 10 tick（约 30s）补一条注释行，防代理超时
@@ -137,7 +159,8 @@ router.get('/api/admin/system/stream', authRequired, (req, res) => {
 });
 
 // 服务状态（需鉴权）。返回各服务 [{ name, status: up/down, pid? }]、
-// 进程排行 TOP15 与全部进程瞬时 CPU 合计 total_cpu（与系统卡片同口径）。
+// 全量进程树 processes（单行含 ppid 与 subtree_mem_mb / subtree_cpu）、count / truncated /
+// total_mem_mb 与全部进程瞬时 CPU 合计 total_cpu（与系统卡片同口径）。
 // collectProcesses 内部做单次 /proc 全量遍历，进程 cpu 与 total_cpu 同源同基准
 router.get('/api/admin/services', authRequired, async (req, res) => {
   try {
