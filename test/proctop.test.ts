@@ -23,6 +23,8 @@ const {
   serviceUnitName,
   cgroupMemoryPath,
   resolveMaxProcessRows,
+  parseThreadCount,
+  sumThreads,
   DEFAULT_MAX_PROCESS_ROWS,
   MAX_PROCESS_ROWS
 } = require('../src/metrics/proctop.ts');
@@ -298,6 +300,33 @@ test('cgroupMemoryPath：服务单元在 system.slice 下，slice 自身直连',
     cgroupMemoryPath('system.slice'),
     '/sys/fs/cgroup/system.slice/memory.current'
   );
+});
+
+// ---------- 线程数：/proc/<pid>/task 条目解析 + 顶层求和 ----------
+
+test('parseThreadCount：数组条目按数字 tid 计数，非数组（读不到）一律 null', () => {
+  assert.equal(parseThreadCount(['1']), 1);
+  assert.equal(parseThreadCount(['1', '2', '3', '4']), 4);
+  // 异常/竞态残留项（非数字）不计入
+  assert.equal(parseThreadCount(['1', '2', 'not-a-tid', '', '.', '..']), 2);
+  // 读到目录但为空：如实为 0（不是读不到）
+  assert.equal(parseThreadCount([]), 0);
+  // 目录不存在 / 权限不足 / 进程已退出：调用方传 null → null，绝不猜 0
+  assert.equal(parseThreadCount(null), null);
+  assert.equal(parseThreadCount(undefined), null);
+  assert.equal(parseThreadCount('/proc/1/task'), null); // 非数组
+});
+
+test('parseThreadCount：数字字符串也接受（readdirSync 返回 string[]，防御非字符串混入）', () => {
+  assert.equal(parseThreadCount([12, 34]), 2);
+  assert.equal(parseThreadCount(['42']), 1);
+});
+
+test('sumThreads：只累加数字 thread_count，null/缺省的行跳过（不按 0 计）', () => {
+  assert.equal(sumThreads([{ thread_count: 1 }, { thread_count: 3 }, { thread_count: 10 }]), 14);
+  assert.equal(sumThreads([{ thread_count: 5 }, { thread_count: null }, {}]), 5);
+  assert.equal(sumThreads([]), 0);
+  assert.equal(sumThreads([{ thread_count: null }]), 0);
 });
 
 // ---------- buildProcessTree：subtree_count（含自身） ----------

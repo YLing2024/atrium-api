@@ -13,6 +13,10 @@ import type {} from 'node:child_process';
  *   - 单行新增 subtree_count（服务端算好，前端不再自己数）与 cgroup_mem_mb
  *     （仅 systemd 单位主进程行有值，取该单位 cgroup 真值，取不到为 null）；
  *   - 顶层新增 total_cgroup_mb（system.slice 的 cgroup 真值）。
+ * 2026-10-14 第二轮：
+ *   - 单行新增 thread_count（该进程线程数，读 /proc/<pid>/task 条目数，读不到为 null），
+ *     顶层新增 total_threads（全部进程线程数之和，截断前口径）——面板进程数与 htop/btop
+ *     的线程数口径差异需要并列给用户看，两者不得混算。
  */
 
 const { exec, execSync } = require('child_process') as typeof import('child_process');
@@ -71,6 +75,8 @@ type ProcNode = {
   subtree_cpu: number;
   subtree_count: number;
   cgroup_mem_mb: number | null;
+  // 该进程线程数（/proc/<pid>/task 条目数）；进程已退出 / 读不到为 null（绝不猜 0）。
+  thread_count: number | null;
 };
 
 /* ============ 纯函数（供单测直接调用，不触碰真实 ps / docker） ============ */
@@ -268,6 +274,23 @@ function buildProcessTree<T extends { pid: number; ppid: number; mem_mb: number;
   return nodes;
 }
 
+// /proc/<pid>/task 的目录条目 → 该进程线程数。条目名即 tid（数字）；非数字项（异常/竞态残留）不计。
+// 读到目录（哪怕是空目录）返回条目数；entries 非数组（目录不存在 / 权限不足 / 进程已退出）→ null，
+// 绝不猜 0——0 线程的进程不存在，猜 0 会让总数偏小且无法自证。
+function parseThreadCount(entries: unknown): number | null {
+  if (!Array.isArray(entries)) return null;
+  let n = 0;
+  for (const e of entries) if (/^\d+$/.test(String(e))) n += 1;
+  return n;
+}
+
+// 顶层线程总数：各行 thread_count 之和；null（读不到）的行跳过，不按 0 计入（保证总数只少不多、不被污染）。
+function sumThreads(rows: ReadonlyArray<{ thread_count?: number | null }>): number {
+  let n = 0;
+  for (const r of rows) if (typeof r.thread_count === 'number') n += r.thread_count;
+  return n;
+}
+
 /* ============ 采集 ============ */
 
 // docker ps 一次，建「12 位短 ID → 容器名」映射；超时 3s，失败静默返回空 Map（不影响其余进程）。
@@ -303,6 +326,15 @@ async function readCgroupMb(name: string): Promise<number | null> {
   }
 }
 
+// 读一个进程的线程数（/proc/<pid>/task 条目数）：进程已退出 / 权限不足 / 目录不存在 → null（绝不猜）。
+function readThreadCount(pid: number): number | null {
+  try {
+    return parseThreadCount(fs.readdirSync('/proc/' + pid + '/task'));
+  } catch {
+    return null;
+  }
+}
+
 // 采集全部进程（不再截断为 TOP15）：
 // - 命名：pid 命中 systemd 主进程映射 → 服务名；containerd shim → 容器名（前缀匹配，失败回退 comm）；
 //   其余按 comm/args 兜底分类。
@@ -311,7 +343,7 @@ async function readCgroupMb(name: string): Promise<number | null> {
 // - 安全上限（默认 2000，可用 ADMIN_PROC_MAX_ROWS 覆盖）：按内存降序截断并标 truncated；
 //   count / total_mem_mb 均为截断前全量口径。
 // - cgroup 真值：仅对「主 PID 保留在结果里」的 systemd 单位逐单位取（并发），取不到为 null。
-// 返回 { processes, count, truncated, total_mem_mb, total_cpu, parsed_count, skipped_count, total_cgroup_mb }。
+// 返回 { processes, count, truncated, total_mem_mb, total_cpu, parsed_count, skipped_count, total_cgroup_mb, total_threads }。
 async function collectProcesses(): Promise<{
   processes: ProcNode[];
   count: number;
@@ -321,6 +353,7 @@ async function collectProcesses(): Promise<{
   parsed_count: number;
   skipped_count: number;
   total_cgroup_mb: number | null;
+  total_threads: number;
 }> {
   // 延迟加载（见文件头说明）：仅在真正采集时拉起 system/services 依赖
   const { collectAllProcCpu } = require('../probe/system.ts') as {
@@ -370,16 +403,23 @@ async function collectProcesses(): Promise<{
     rows = [];
   }
 
-  // 5. 仅当存在 containerd shim 时才查 docker（一次，3s 超时，失败静默回退 comm）。
+  // 5. 线程数：读 /proc/<pid>/task 条目数。覆盖 ps 解析出的**全量**行（截断前），
+  //    使 total_threads 与 `ps -eLf | wc -l` 同口径；读不到记 null。放在截断之前，
+  //    这样被截断掉的行也计入线程总数（与 count / total_mem_mb 同为截断前口径）。
+  const threadByPid = new Map<number, number | null>();
+  for (const r of rows) threadByPid.set(r.pid, readThreadCount(r.pid));
+  const total_threads = sumThreads(rows.map((r) => ({ thread_count: threadByPid.get(r.pid) ?? null })));
+
+  // 6. 仅当存在 containerd shim 时才查 docker（一次，3s 超时，失败静默回退 comm）。
   //    放在 ps 之后：docker 自身进程不会被上面的 ps 快照计入。
   const containerMap = rows.some((r) => /^containerd-shim/.test(r.comm))
     ? await collectContainerNames()
     : new Map<string, string>();
 
-  // 6. 截断 + 合计（先用带 rss_kb 的原始行，保证 total_mem_mb 与 ps 实测同口径）
+  // 7. 截断 + 合计（先用带 rss_kb 的原始行，保证 total_mem_mb 与 ps 实测同口径）
   const { processes: kept, count, truncated, total_mem_mb } = summarizeProcesses(rows, MAX_PROCESS_ROWS);
 
-  // 7. cgroup 真值：只对「主 PID 仍在 kept 里」的单位取（非主进程行不取，保持 null）。
+  // 8. cgroup 真值：只对「主 PID 仍在 kept 里」的单位取（非主进程行不取，保持 null）。
   //    total_cgroup_mb 取 system.slice 整片真值。全部并发，任一失败 → null，绝不影响主响应。
   const keptPids = new Set(kept.map((r) => r.pid));
   const serviceUnits = [...pidToService.entries()].filter(([pid]) => keptPids.has(pid));
@@ -390,7 +430,7 @@ async function collectProcesses(): Promise<{
   const cgroupByPid = new Map<number, number | null>();
   serviceUnits.forEach(([pid], i) => cgroupByPid.set(pid, unitCgroups[i]));
 
-  // 8. 命名 + CPU 覆盖 + cgroup 归属 → 构树（buildProcessTree 补 subtree_* / subtree_count）
+  // 9. 命名 + CPU 覆盖 + cgroup/线程归属 → 构树（buildProcessTree 补 subtree_* / subtree_count）
   const named: Array<Omit<ProcNode, 'subtree_mem_mb' | 'subtree_cpu' | 'subtree_count'>> = kept.map(
     (r) => ({
       name: resolveProcessName(r, pidToService, containerMap),
@@ -398,7 +438,8 @@ async function collectProcesses(): Promise<{
       ppid: r.ppid,
       mem_mb: r.mem_mb,
       cpu: perPid.has(r.pid) ? (perPid.get(r.pid) as number) : r.cpu,
-      cgroup_mem_mb: pidToService.has(r.pid) ? cgroupByPid.get(r.pid) ?? null : null
+      cgroup_mem_mb: pidToService.has(r.pid) ? cgroupByPid.get(r.pid) ?? null : null,
+      thread_count: threadByPid.get(r.pid) ?? null
     })
   );
 
@@ -410,7 +451,8 @@ async function collectProcesses(): Promise<{
     total_cpu: totalPct,
     parsed_count: parsedCount,
     skipped_count: skippedCount,
-    total_cgroup_mb: totalCgroup
+    total_cgroup_mb: totalCgroup,
+    total_threads
   };
 }
 
@@ -428,6 +470,8 @@ module.exports = {
   serviceUnitName,
   cgroupMemoryPath,
   resolveMaxProcessRows,
+  parseThreadCount,
+  sumThreads,
   DEFAULT_MAX_PROCESS_ROWS,
   MAX_PROCESS_ROWS
 };
