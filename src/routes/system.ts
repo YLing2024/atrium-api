@@ -29,6 +29,7 @@ const { collectProcesses } = require('../metrics/proctop.ts') as {
     parsed_count: number;
     skipped_count: number;
     total_cgroup_mb: number | null;
+    total_threads: number;
   }>;
 };
 const { sampleHistory, readHistory } = require('../metrics/store.ts') as {
@@ -61,7 +62,7 @@ async function buildSystemPayload() {
 
 // 组装服务状态（REST /api/admin/services 专用）：服务列表 + 全量进程树 +
 // count / truncated / total_mem_mb / total_cpu + 解析计数 parsed_count / skipped_count +
-// cgroup 真值 total_cgroup_mb。SSE 帧不再携带进程明细，见下方 stream 路由。
+// cgroup 真值 total_cgroup_mb + 线程总数 total_threads。SSE 帧不再携带进程明细，见下方 stream 路由。
 async function buildServicesPayload() {
   const [services, result] = await Promise.all([collectServices(), collectProcesses()]);
   return {
@@ -73,7 +74,8 @@ async function buildServicesPayload() {
     total_cpu: result.total_cpu,
     parsed_count: result.parsed_count,
     skipped_count: result.skipped_count,
-    total_cgroup_mb: result.total_cgroup_mb
+    total_cgroup_mb: result.total_cgroup_mb,
+    total_threads: result.total_threads
   };
 }
 
@@ -166,9 +168,10 @@ router.get('/api/admin/system/stream', authRequired, (req, res) => {
 });
 
 // 服务状态（需鉴权）。返回各服务 [{ name, status: up/down, pid? }]、
-// 全量进程树 processes（单行含 ppid、subtree_mem_mb / subtree_cpu / subtree_count 与
-// cgroup_mem_mb）、count / truncated / total_mem_mb、全部进程瞬时 CPU 合计 total_cpu
-// （与系统卡片同口径）、解析计数 parsed_count / skipped_count 与 cgroup 真值 total_cgroup_mb。
+// 全量进程树 processes（单行含 ppid、subtree_mem_mb / subtree_cpu / subtree_count、
+// cgroup_mem_mb 与 thread_count）、count / truncated / total_mem_mb、全部进程瞬时 CPU 合计
+// total_cpu（与系统卡片同口径）、解析计数 parsed_count / skipped_count、cgroup 真值
+// total_cgroup_mb 与线程总数 total_threads。
 // collectProcesses 内部做单次 /proc 全量遍历，进程 cpu 与 total_cpu 同源同基准
 router.get('/api/admin/services', authRequired, async (req, res) => {
   try {

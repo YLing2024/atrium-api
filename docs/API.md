@@ -38,8 +38,10 @@
 | `subtree_mem_mb` | 该进程**自身 + 全部后代**的 RSS 之和（MB，整数）；同样含共享页重复计算 |
 | `subtree_cpu` | 该进程自身 + 全部后代的瞬时 CPU 之和（%），与 `cpu` 同源同基准 |
 | `subtree_count` | 含自身的后代进程数（整数） |
+| `thread_count` | 该进程的线程数（读 `/proc/<pid>/task` 条目数，整数）；进程已退出/读不到为 `null` |
 | `cgroup_mem_mb` | 该 systemd 单位 cgroup 的**真值**（MB，整数，含页缓存）；与 RSS 口径不同、不可直接比 |
 | `total_mem_mb` | 全部进程 RSS 之和（MB，整数）；含共享页重复计算 |
+| `total_threads` | 全部进程线程数之和（整数，截断前口径）；与 `count` 是**两个口径，不得混算** |
 | `total_cgroup_mb` | `system.slice` 的 cgroup 真值（MB，整数） |
 | `total_cpu` | 系统**总** CPU 占用（%），**不是**列表之和 |
 | `mem_percent` / `cpu.usage_percent` | 百分比（0–100） |
@@ -154,13 +156,13 @@
         "name": "systemd", "pid": 1, "ppid": 0,
         "mem_mb": 15, "cpu": 0.1,
         "subtree_mem_mb": 7845, "subtree_cpu": 12.3, "subtree_count": 300,
-        "cgroup_mem_mb": null
+        "cgroup_mem_mb": null, "thread_count": 1
       },
       {
         "name": "admin-server", "pid": 2345, "ppid": 1,
         "mem_mb": 80, "cpu": 0.4,
         "subtree_mem_mb": 120, "subtree_cpu": 1.2, "subtree_count": 3,
-        "cgroup_mem_mb": 118
+        "cgroup_mem_mb": 118, "thread_count": 11
       }
     ],
     "count": 344,
@@ -169,7 +171,8 @@
     "total_cpu": 12.3,
     "parsed_count": 344,
     "skipped_count": 0,
-    "total_cgroup_mb": 11459
+    "total_cgroup_mb": 11459,
+    "total_threads": 1401
   }
   ```
 
@@ -184,8 +187,9 @@
   | `parsed_count` | number | `ps` 输出成功解析的行数 |
   | `skipped_count` | number | 解析失败被丢弃的行数（`>0` 前端应提示） |
   | `total_cgroup_mb` | number \| null | `system.slice` 的 cgroup 真值；取不到为 `null` |
+  | `total_threads` | number | 全部进程线程数之和（截断前口径）；与 `count` 为两个口径，**不得相加/混算** |
 
-  单行字段：`name` / `pid` / `ppid` / `mem_mb`（自身 RSS）/ `cpu` / `subtree_mem_mb` / `subtree_cpu` / `subtree_count` / `cgroup_mem_mb`（仅 systemd 单位主进程行有值，否则 `null`）。
+  单行字段：`name` / `pid` / `ppid` / `mem_mb`（自身 RSS）/ `cpu` / `subtree_mem_mb` / `subtree_cpu` / `subtree_count` / `cgroup_mem_mb`（仅 systemd 单位主进程行有值，否则 `null`）/ `thread_count`（读 `/proc/<pid>/task` 条目数，取不到为 `null`）。
 
 - 错误码：
 
