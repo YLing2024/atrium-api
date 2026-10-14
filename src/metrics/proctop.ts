@@ -5,12 +5,19 @@ import type {} from 'node:child_process';
 
 /**
  * 进程排行：全量进程 + 瞬时 CPU（与系统卡片同一套 /proc 差分与 EMA 平滑）。
- * 2026-10-13 改造：不再截断成「内存 TOP15」，改为返回全部进程（硬上限 500 行），
- * 单行补 ppid 与 subtree_mem_mb / subtree_cpu（该节点含全部后代的和），供前端构树。
+ * 2026-10-13 改造：不再截断成「内存 TOP15」，改为返回全部进程，单行补 ppid 与
+ *   subtree_mem_mb / subtree_cpu（该节点含全部后代的和），供前端构树。
+ * 2026-10-14 修正：
+ *   - 硬上限 500 → 2000，并支持 ADMIN_PROC_MAX_ROWS 覆盖（非法值回退默认）；
+ *   - 新增解析计数（parsed_count / skipped_count），解析失败不再静默丢弃；
+ *   - 单行新增 subtree_count（服务端算好，前端不再自己数）与 cgroup_mem_mb
+ *     （仅 systemd 单位主进程行有值，取该单位 cgroup 真值，取不到为 null）；
+ *   - 顶层新增 total_cgroup_mb（system.slice 的 cgroup 真值）。
  */
 
 const { exec, execSync } = require('child_process') as typeof import('child_process');
 const { promisify } = require('util') as typeof import('util');
+const fs = require('fs') as typeof import('fs');
 
 const execAsync = promisify(exec);
 
@@ -19,8 +26,20 @@ const execAsync = promisify(exec);
 // 为让本模块可被单测安全 import（纯函数不触碰 ps/docker/Redis），这两个依赖延迟到 collectProcesses
 // 内首次调用时再 require（CJS require 有缓存，重复调用无额外开销）。
 
-// 安全上限：全量进程的正常规模在数百条，硬上限兜底防止极端环境下响应体过大。
-const MAX_PROCESS_ROWS = 500;
+// 安全上限默认值：全量进程正常规模在数百条，硬上限兜底极端环境下响应体过大。
+// 2026-10-14 由 500 提升到 2000（500 曾把极端环境下的全量进程截断，用户会以为「漏进程」）。
+const DEFAULT_MAX_PROCESS_ROWS = 2000;
+
+// 解析 ADMIN_PROC_MAX_ROWS：只接受纯正整数字符串（'0' / '-1' / '12abc' / 空 均视为非法），
+// 非法或未设置一律回退 fallback。抽成纯函数以便单测（环境变量是外部输入，绝不采信）。
+function resolveMaxProcessRows(raw: unknown, fallback = DEFAULT_MAX_PROCESS_ROWS): number {
+  const s = String(raw == null ? '' : raw).trim();
+  if (!/^\d+$/.test(s)) return fallback;
+  const n = Number(s);
+  return Number.isSafeInteger(n) && n > 0 ? n : fallback;
+}
+
+const MAX_PROCESS_ROWS = resolveMaxProcessRows(process.env.ADMIN_PROC_MAX_ROWS);
 
 // ps 输出的一行（内部中间结构，比对外响应多出 comm/args/rss_kb 原始字段）
 type ProcRow = {
@@ -39,7 +58,9 @@ type ProcRow = {
 // 后按位解析即可对齐；comm 之后的 rss/pcpu 为定宽数值列，args 为行尾剩余。
 const PS_LINE_RE = /^\s*(\d+)\s+(\d+)\s+(.{16})\s+(\d+)\s+([\d.]+)\s*(.*)$/;
 
-// 对外响应的一行：内存自身 RSS / CPU 自身，子树字段为含全部后代的和
+// 对外响应的一行：内存自身 RSS / CPU 自身，子树字段为含全部后代的和。
+// cgroup_mem_mb 仅当该行是 systemd 单位主进程时为该单位 cgroup 真值，否则 null
+// （口径见 docs/API.md：cgroup 含页缓存，与 RSS 不可比）。
 type ProcNode = {
   name: string;
   pid: number;
@@ -48,18 +69,29 @@ type ProcNode = {
   cpu: number;
   subtree_mem_mb: number;
   subtree_cpu: number;
+  subtree_count: number;
+  cgroup_mem_mb: number | null;
 };
 
 /* ============ 纯函数（供单测直接调用，不触碰真实 ps / docker） ============ */
 
 // ps 文本 → 行数组。列序 pid,ppid,comm,rss,pcpu,args，其中 comm 定宽 16 列（见 PS_LINE_RE）。
 // rss 单位 kB → mem_mb 取整；pcpu 直接作为 cpu 兜底（collectProcesses 再用 /proc 差分结果覆盖）。
-function parsePsOutput(text: string): ProcRow[] {
+// 解析计数：空行不计；非空但格式不符的行计入 skipped_count（此前是静默丢弃，无法自证完整）。
+function parsePsOutputWithStats(text: string): {
+  rows: ProcRow[];
+  parsed_count: number;
+  skipped_count: number;
+} {
   const rows: ProcRow[] = [];
+  let skipped_count = 0;
   for (const line of String(text).split('\n')) {
     if (!line.trim()) continue;
     const m = PS_LINE_RE.exec(line);
-    if (!m) continue;
+    if (!m) {
+      skipped_count += 1;
+      continue;
+    }
     const pid = parseInt(m[1], 10);
     const ppid = parseInt(m[2], 10);
     const rssKb = parseInt(m[4], 10) || 0;
@@ -73,7 +105,12 @@ function parsePsOutput(text: string): ProcRow[] {
       cpu: Math.round((parseFloat(m[5]) || 0) * 10) / 10
     });
   }
-  return rows;
+  return { rows, parsed_count: rows.length, skipped_count };
+}
+
+// 兼容入口：只返回行数组（既有调用方与单测语义不变）
+function parsePsOutput(text: string): ProcRow[] {
+  return parsePsOutputWithStats(text).rows;
 }
 
 // 从 containerd shim 的 args 里取 `-id <容器 ID>`（兼容 --id；容器 ID 为十六进制）。
@@ -107,6 +144,34 @@ function matchContainerName(
     if (containerId.startsWith(shortId)) return name;
   }
   return null;
+}
+
+// cgroup 内存真值解析：cgroup v2 memory.current / systemctl MemoryCurrent 都是十进制字节。
+// → MB 整数；空、'[not set]'、'infinity'、负数、超出安全整数的哨兵值一律 null（绝不猜）。
+function parseCgroupBytesToMb(raw: unknown): number | null {
+  const s = String(raw == null ? '' : raw).trim();
+  if (!s || s === '[not set]') return null;
+  const n = Number(s);
+  if (!Number.isFinite(n) || n < 0 || n > Number.MAX_SAFE_INTEGER) return null;
+  return Math.round(n / 1024 / 1024);
+}
+
+// systemd 单元名规范化：裸名（如 'admin-server'）补 '.service'；已带已知后缀的保持原样。
+function serviceUnitName(name: unknown): string {
+  const s = String(name == null ? '' : name).trim();
+  if (!s) return s;
+  return /\.(service|socket|slice|target|mount|timer|path|scope|device)$/.test(s)
+    ? s
+    : s + '.service';
+}
+
+// 单元 cgroup 内存文件路径：优先 cgroup v2 真值文件。
+// 服务单元 → /sys/fs/cgroup/system.slice/<unit>.service/memory.current；
+// slice 自身 → /sys/fs/cgroup/<slice>/memory.current。
+function cgroupMemoryPath(name: unknown, slice = 'system.slice'): string {
+  const unit = serviceUnitName(name);
+  if (unit.endsWith('.slice')) return `/sys/fs/cgroup/${unit}/memory.current`;
+  return `/sys/fs/cgroup/${slice}/${unit}/memory.current`;
 }
 
 // 进程命名：优先级 systemd MainPID → 容器 shim（容器名）→ opencode / agent-browser /
@@ -153,11 +218,17 @@ function summarizeProcesses<T extends ProcRow>(rows: T[], limit = MAX_PROCESS_RO
 }
 
 // 构造父子关系并算子树合计（纯函数）：按 ppid 挂到父节点；ppid 不在集合内 / 自环视为根。
-// 节点子树合计 = 自身 + 全部后代之和；对异常环路做保护（回边直接跳过），保证绝不无限递归。
+// 节点子树合计 = 自身 + 全部后代之和；subtree_count = 含自身的后代进程数。
+// 对异常环路做保护（回边直接跳过），保证绝不无限递归。
 function buildProcessTree<T extends { pid: number; ppid: number; mem_mb: number; cpu: number }>(
   rows: T[]
-): Array<T & { subtree_mem_mb: number; subtree_cpu: number }> {
-  const nodes = rows.map((r) => ({ ...r, subtree_mem_mb: r.mem_mb, subtree_cpu: r.cpu }));
+): Array<T & { subtree_mem_mb: number; subtree_cpu: number; subtree_count: number }> {
+  const nodes = rows.map((r) => ({
+    ...r,
+    subtree_mem_mb: r.mem_mb,
+    subtree_cpu: r.cpu,
+    subtree_count: 1
+  }));
   const byPid = new Map<number, (typeof nodes)[number]>();
   for (const n of nodes) byPid.set(n.pid, n);
 
@@ -178,15 +249,18 @@ function buildProcessTree<T extends { pid: number; ppid: number; mem_mb: number;
     mark.set(pid, 1);
     let mem = n.mem_mb;
     let cpu = n.cpu;
+    let count = 1;
     for (const c of children.get(pid) || []) {
       const child = visit(c);
       if (child) {
         mem += child.subtree_mem_mb;
         cpu += child.subtree_cpu;
+        count += child.subtree_count;
       }
     }
     n.subtree_mem_mb = mem;
     n.subtree_cpu = Math.round(cpu * 10) / 10;
+    n.subtree_count = count;
     mark.set(pid, 2);
     return n;
   };
@@ -209,19 +283,44 @@ async function collectContainerNames(): Promise<Map<string, string>> {
   }
 }
 
+// 读一个 systemd 单位的 cgroup 内存真值（bytes→MB）：优先 cgroup v2 真值文件，
+// 回退 `systemctl show <unit> -p MemoryCurrent --value`；任何失败 → null（绝不猜）。
+async function readCgroupMb(name: string): Promise<number | null> {
+  try {
+    const mb = parseCgroupBytesToMb(fs.readFileSync(cgroupMemoryPath(name), 'utf-8'));
+    if (mb != null) return mb;
+  } catch (e: any) {
+    // 文件缺失/不可读 → 走 systemctl 回退
+  }
+  try {
+    const { stdout } = await execAsync(
+      `systemctl show ${serviceUnitName(name)} -p MemoryCurrent --value`,
+      { encoding: 'utf-8', timeout: 3000 }
+    );
+    return parseCgroupBytesToMb(stdout);
+  } catch {
+    return null;
+  }
+}
+
 // 采集全部进程（不再截断为 TOP15）：
 // - 命名：pid 命中 systemd 主进程映射 → 服务名；containerd shim → 容器名（前缀匹配，失败回退 comm）；
 //   其余按 comm/args 兜底分类。
 // - CPU：统一走 collectAllProcCpu() 的单次 /proc 全量遍历，各进程 cpu 取 perPid.get(pid)、
 //   total_cpu 取 totalPct，同一请求内同源同差分基准；pid 缺失时用 ps pcpu 兜底。
-// - 安全上限 500：按内存降序截断并标 truncated；count / total_mem_mb 均为截断前全量口径。
-// 返回 { processes, count, truncated, total_mem_mb, total_cpu }。
+// - 安全上限（默认 2000，可用 ADMIN_PROC_MAX_ROWS 覆盖）：按内存降序截断并标 truncated；
+//   count / total_mem_mb 均为截断前全量口径。
+// - cgroup 真值：仅对「主 PID 保留在结果里」的 systemd 单位逐单位取（并发），取不到为 null。
+// 返回 { processes, count, truncated, total_mem_mb, total_cpu, parsed_count, skipped_count, total_cgroup_mb }。
 async function collectProcesses(): Promise<{
   processes: ProcNode[];
   count: number;
   truncated: boolean;
   total_mem_mb: number;
   total_cpu: number;
+  parsed_count: number;
+  skipped_count: number;
+  total_cgroup_mb: number | null;
 }> {
   // 延迟加载（见文件头说明）：仅在真正采集时拉起 system/services 依赖
   const { collectAllProcCpu } = require('../probe/system.ts') as {
@@ -257,11 +356,16 @@ async function collectProcesses(): Promise<{
   // 4. ps 全量（新增 ppid，去掉 head/tail）：--sort=-rss 保持内存降序。
   //    comm 定宽 16 列（comm:16），解析按位对齐，避免 comm 含空格时列错位（见 PS_LINE_RE）
   let rows: ProcRow[] = [];
+  let parsedCount = 0;
+  let skippedCount = 0;
   try {
     const out = execSync('ps -eo pid=,ppid=,comm:16=,rss=,pcpu=,args= --sort=-rss', {
       encoding: 'utf-8'
     });
-    rows = parsePsOutput(out);
+    const parsed = parsePsOutputWithStats(out);
+    rows = parsed.rows;
+    parsedCount = parsed.parsed_count;
+    skippedCount = parsed.skipped_count;
   } catch {
     rows = [];
   }
@@ -272,34 +376,58 @@ async function collectProcesses(): Promise<{
     ? await collectContainerNames()
     : new Map<string, string>();
 
-  // 6. 截断 + 合计（先用带 rss_kb 的原始行，保证 total_mem_mb 与 ps 实测同口径），
-  //    再对保留下来的行做命名 + CPU 覆盖 + 子树合计
+  // 6. 截断 + 合计（先用带 rss_kb 的原始行，保证 total_mem_mb 与 ps 实测同口径）
   const { processes: kept, count, truncated, total_mem_mb } = summarizeProcesses(rows, MAX_PROCESS_ROWS);
-  const named: Array<Omit<ProcNode, 'subtree_mem_mb' | 'subtree_cpu'>> = kept.map((r) => ({
-    name: resolveProcessName(r, pidToService, containerMap),
-    pid: r.pid,
-    ppid: r.ppid,
-    mem_mb: r.mem_mb,
-    cpu: perPid.has(r.pid) ? (perPid.get(r.pid) as number) : r.cpu
-  }));
+
+  // 7. cgroup 真值：只对「主 PID 仍在 kept 里」的单位取（非主进程行不取，保持 null）。
+  //    total_cgroup_mb 取 system.slice 整片真值。全部并发，任一失败 → null，绝不影响主响应。
+  const keptPids = new Set(kept.map((r) => r.pid));
+  const serviceUnits = [...pidToService.entries()].filter(([pid]) => keptPids.has(pid));
+  const [totalCgroup, ...unitCgroups] = await Promise.all([
+    readCgroupMb('system.slice'),
+    ...serviceUnits.map(([, unit]) => readCgroupMb(unit))
+  ]);
+  const cgroupByPid = new Map<number, number | null>();
+  serviceUnits.forEach(([pid], i) => cgroupByPid.set(pid, unitCgroups[i]));
+
+  // 8. 命名 + CPU 覆盖 + cgroup 归属 → 构树（buildProcessTree 补 subtree_* / subtree_count）
+  const named: Array<Omit<ProcNode, 'subtree_mem_mb' | 'subtree_cpu' | 'subtree_count'>> = kept.map(
+    (r) => ({
+      name: resolveProcessName(r, pidToService, containerMap),
+      pid: r.pid,
+      ppid: r.ppid,
+      mem_mb: r.mem_mb,
+      cpu: perPid.has(r.pid) ? (perPid.get(r.pid) as number) : r.cpu,
+      cgroup_mem_mb: pidToService.has(r.pid) ? cgroupByPid.get(r.pid) ?? null : null
+    })
+  );
 
   return {
     processes: buildProcessTree(named),
     count,
     truncated,
     total_mem_mb,
-    total_cpu: totalPct
+    total_cpu: totalPct,
+    parsed_count: parsedCount,
+    skipped_count: skippedCount,
+    total_cgroup_mb: totalCgroup
   };
 }
 
 module.exports = {
   collectProcesses,
   parsePsOutput,
+  parsePsOutputWithStats,
   resolveProcessName,
   extractShimContainerId,
   parseDockerPs,
   matchContainerName,
   summarizeProcesses,
   buildProcessTree,
+  parseCgroupBytesToMb,
+  serviceUnitName,
+  cgroupMemoryPath,
+  resolveMaxProcessRows,
+  DEFAULT_MAX_PROCESS_ROWS,
   MAX_PROCESS_ROWS
 };

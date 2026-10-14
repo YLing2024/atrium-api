@@ -12,12 +12,18 @@ const assert = require('node:assert/strict');
 
 const {
   parsePsOutput,
+  parsePsOutputWithStats,
   resolveProcessName,
   extractShimContainerId,
   parseDockerPs,
   matchContainerName,
   summarizeProcesses,
   buildProcessTree,
+  parseCgroupBytesToMb,
+  serviceUnitName,
+  cgroupMemoryPath,
+  resolveMaxProcessRows,
+  DEFAULT_MAX_PROCESS_ROWS,
   MAX_PROCESS_ROWS
 } = require('../src/metrics/proctop.ts');
 
@@ -216,4 +222,97 @@ test('resolveProcessName：既有命名规则保持不变', () => {
   assert.equal(resolveProcessName(mk('python3'), new Map(), new Map()), 'python');
   assert.equal(resolveProcessName(mk('opencode'), new Map(), new Map()), 'opencode');
   assert.equal(resolveProcessName(mk('bash'), new Map(), new Map()), 'bash');
+});
+
+// ---------- resolveMaxProcessRows：环境变量覆盖（非法回退默认） ----------
+
+test('resolveMaxProcessRows：合法纯正整数采用，非法/空/超界回退默认', () => {
+  assert.equal(DEFAULT_MAX_PROCESS_ROWS, 2000);
+  assert.equal(resolveMaxProcessRows('3000'), 3000);
+  assert.equal(resolveMaxProcessRows(3000), 3000);
+  assert.equal(resolveMaxProcessRows(' 42 '), 42); // 首尾空白容忍
+  // 非法一律回退默认（默认由实现给出，此处只断言等于 DEFAULT_MAX_PROCESS_ROWS）
+  for (const bad of [undefined, null, '', '  ', 'abc', '0', '-5', '12abc', '3e3', '1.9']) {
+    assert.equal(resolveMaxProcessRows(bad), DEFAULT_MAX_PROCESS_ROWS, `bad=${String(bad)}`);
+  }
+  // 超出安全整数范围的字符串回退默认
+  assert.equal(resolveMaxProcessRows('99999999999999999999'), DEFAULT_MAX_PROCESS_ROWS);
+  // 自定义 fallback 生效
+  assert.equal(resolveMaxProcessRows('abc', 777), 777);
+});
+
+// ---------- parsePsOutputWithStats：解析计数（失败不再静默丢弃） ----------
+
+test('parsePsOutputWithStats：空行不计，非空不合格式计入 skipped_count', () => {
+  const sample = [
+    psLine(1, 0, 'systemd', 1024, 0.1, '/sbin/init'),
+    'garbage line',
+    '',
+    '   ',
+    psLine(2, 1, 'node', 2048, 0.2, 'node x')
+  ].join('\n');
+  const r = parsePsOutputWithStats(sample);
+  assert.equal(r.rows.length, 2);
+  assert.equal(r.parsed_count, 2);
+  assert.equal(r.skipped_count, 1); // 只有 'garbage line' 计失败；空行/纯空白不计
+});
+
+test('parsePsOutputWithStats：全空输出计数为 0', () => {
+  const r = parsePsOutputWithStats('\n\n');
+  assert.deepEqual(r, { rows: [], parsed_count: 0, skipped_count: 0 });
+});
+
+// ---------- cgroup 纯函数：数值解析 / 单元名 / 文件路径 ----------
+
+test('parseCgroupBytesToMb：字节→MB 取整，非法/哨兵/负数一律 null', () => {
+  assert.equal(parseCgroupBytesToMb('1048576'), 1); // 1 MiB
+  assert.equal(parseCgroupBytesToMb('2621440'), 3); // 2.5 MiB → 四舍五入 3
+  assert.equal(parseCgroupBytesToMb('0'), 0);
+  assert.equal(parseCgroupBytesToMb(''), null);
+  assert.equal(parseCgroupBytesToMb('   '), null);
+  assert.equal(parseCgroupBytesToMb('[not set]'), null);
+  assert.equal(parseCgroupBytesToMb('infinity'), null);
+  assert.equal(parseCgroupBytesToMb('-1'), null);
+  assert.equal(parseCgroupBytesToMb('18446744073709551615'), null); // UINT64_MAX 哨兵
+  assert.equal(parseCgroupBytesToMb(null), null);
+});
+
+test('serviceUnitName：裸名补 .service，已带已知后缀的保持', () => {
+  assert.equal(serviceUnitName('admin-server'), 'admin-server.service');
+  assert.equal(serviceUnitName('redis-server'), 'redis-server.service');
+  assert.equal(serviceUnitName('nginx.service'), 'nginx.service');
+  assert.equal(serviceUnitName('system.slice'), 'system.slice');
+  assert.equal(serviceUnitName(''), '');
+});
+
+test('cgroupMemoryPath：服务单元在 system.slice 下，slice 自身直连', () => {
+  assert.equal(
+    cgroupMemoryPath('admin-server'),
+    '/sys/fs/cgroup/system.slice/admin-server.service/memory.current'
+  );
+  assert.equal(
+    cgroupMemoryPath('nginx.service'),
+    '/sys/fs/cgroup/system.slice/nginx.service/memory.current'
+  );
+  assert.equal(
+    cgroupMemoryPath('system.slice'),
+    '/sys/fs/cgroup/system.slice/memory.current'
+  );
+});
+
+// ---------- buildProcessTree：subtree_count（含自身） ----------
+
+test('buildProcessTree：subtree_count 为含自身的后代数，叶子为 1', () => {
+  const tree = buildProcessTree([
+    { pid: 1, ppid: 0, mem_mb: 1, cpu: 0 },
+    { pid: 2, ppid: 1, mem_mb: 1, cpu: 0 },
+    { pid: 3, ppid: 1, mem_mb: 1, cpu: 0 },
+    { pid: 4, ppid: 2, mem_mb: 1, cpu: 0 }
+  ]);
+  const by = new Map<number, any>();
+  for (const n of tree) by.set(n.pid, n);
+  assert.equal(by.get(1).subtree_count, 4); // 自身 + 2 + 3 + 4
+  assert.equal(by.get(2).subtree_count, 2); // 自身 + 4
+  assert.equal(by.get(3).subtree_count, 1);
+  assert.equal(by.get(4).subtree_count, 1);
 });
