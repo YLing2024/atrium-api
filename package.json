@@ -8,8 +8,9 @@
     "start": "node src/index.ts",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
+    "check:api-docs": "node scripts/check-api-docs.mjs",
     "test": "node --test",
-    "check": "npm run typecheck && npm run lint && npm test"
+    "check": "npm run typecheck && npm run lint && npm test && npm run check:api-docs"
   },
   "engines": {
     "node": ">=24.0.0"
