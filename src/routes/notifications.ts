@@ -34,7 +34,7 @@ const store = require('../notifications/store.ts') as {
   markAllNotificationsRead: (db: import('node:sqlite').DatabaseSync) => number;
   deleteNotification: (db: import('node:sqlite').DatabaseSync, id: number) => void;
   bulkDeleteNotifications: (db: import('node:sqlite').DatabaseSync, f: {
-    level: string | null; source: string | null; type: string | null; unreadOnly: boolean; readOnly: boolean;
+    level: string | null; source: string | null; unreadOnly: boolean; readOnly: boolean;
   }, dryRun: boolean) => number;
   notificationStats: (db: import('node:sqlite').DatabaseSync) => { total: number; unread: number; sources: unknown[] };
 };
@@ -257,9 +257,8 @@ router.delete('/api/admin/notifications/:id', authRequired, (req, res) => {
 });
 
 // 批量删除（需鉴权）：按筛选一次删除多条。
-// body: { level?, source?, type?, unreadOnly?, readOnly?, dryRun? } → { ok: true, count: N }
-// dryRun=true 只统计、不删除，供前端二次确认时拿到准确条数（新增可选字段）。
-// type 为类别维度（新增可选字段，供前端按类别筛选批量删除）。
+// body: { level?, source?, unreadOnly?, readOnly?, dryRun? } → { ok: true, count: N }
+// dryRun=true 只统计、不删除，供前端二次确认时拿到准确条数。
 // 注意：不带任何条件即「全部删除」；审计只记条数与筛选，绝不记 body。
 router.post('/api/admin/notifications/bulk-delete', authRequired, (req, res) => {
   const db = openNotificationsDb();
@@ -267,20 +266,19 @@ router.post('/api/admin/notifications/bulk-delete', authRequired, (req, res) => 
   const b = req.body || {};
   const level = NOTIFICATION_LEVELS.has(String(b.level || '')) ? String(b.level) : null;
   const source = typeof b.source === 'string' && b.source.trim() ? b.source.trim() : null;
-  const type = typeof b.type === 'string' && b.type.trim() ? b.type.trim() : null;
   const unreadOnly = b.unreadOnly === true;
   const readOnly = b.readOnly === true;
   const dryRun = b.dryRun === true;
   // 未读与已读互斥：同时给出时不匹配任何行，避免误删
   if (unreadOnly && readOnly) return res.json({ ok: true, count: 0 });
   try {
-    const count = store.bulkDeleteNotifications(db, { level, source, type, unreadOnly, readOnly }, dryRun);
+    const count = store.bulkDeleteNotifications(db, { level, source, unreadOnly, readOnly }, dryRun);
     if (!dryRun) {
       auditLog(
         'notification_bulk_delete',
         clientIp(req),
         true,
-        `count=${count} level=${level || '-'} source=${source || '-'} type=${type || '-'} unreadOnly=${unreadOnly} readOnly=${readOnly}`
+        `count=${count} level=${level || '-'} source=${source || '-'} unreadOnly=${unreadOnly} readOnly=${readOnly}`
       );
     }
     res.json({ ok: true, count });

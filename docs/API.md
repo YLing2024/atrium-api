@@ -486,7 +486,7 @@
 ### POST /api/admin/notifications/bulk-delete
 
 - 鉴权：`authRequired`
-- 请求参数（body，全部可选）：`{ level?, source?, type?, unreadOnly?, readOnly?, dryRun? }`；`unreadOnly` 与 `readOnly` 同时为真时不匹配任何行（返回 0）
+- 请求参数（body，全部可选）：`{ level?, source?, unreadOnly?, readOnly?, dryRun? }`；`unreadOnly` 与 `readOnly` 同时为真时不匹配任何行（返回 0）
 - curl：`curl -sS -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"level":"digest","dryRun":true}' "$BASE_URL/api/admin/notifications/bulk-delete"`
 - 成功 200：`{ "ok": true, "count": 5 }`（`dryRun=true` 只统计不删）
 - 错误：503；500 `{ "error": "批量删除失败" }`

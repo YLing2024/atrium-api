@@ -291,11 +291,9 @@ function deleteNotification(db: SqliteDatabase, id: number): void {
 }
 
 // 批量删除：按筛选统计/删除；未读与已读互斥由调用方保证。
-// type 为类别维度（与 source 并存），供前端「按类别筛选批量删除」使用。
 type BulkDeleteFilters = {
   level: string | null;
   source: string | null;
-  type: string | null;
   unreadOnly: boolean;
   readOnly: boolean;
 };
@@ -310,10 +308,6 @@ function bulkDeleteNotifications(db: SqliteDatabase, f: BulkDeleteFilters, dryRu
   if (f.source) {
     where.push('source = ?');
     args.push(f.source);
-  }
-  if (f.type) {
-    where.push('type = ?');
-    args.push(f.type);
   }
   if (f.unreadOnly) where.push('read_at IS NULL');
   if (f.readOnly) where.push('read_at IS NOT NULL');

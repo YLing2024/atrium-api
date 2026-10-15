@@ -211,7 +211,7 @@ test('cleanupNotifications：过期通知行与附件目录一并清理', () => 
   assert.equal(attachments.listAttachments(db, r.id).length, 0);
 });
 
-test('bulkDeleteNotifications：dryRun 只统计；实删含附件清理；type 维度生效', () => {
+test('bulkDeleteNotifications：dryRun 只统计；实删含附件清理', () => {
   const a = writeOne({ title: '批量A', typeKey: 'bulk-a', source: 'bulk-a' });
   const b = writeOne({ title: '批量B', typeKey: 'bulk-b', source: 'bulk-b' });
   const parsed = attachments.parseAttachments([
@@ -220,16 +220,16 @@ test('bulkDeleteNotifications：dryRun 只统计；实删含附件清理；type 
   attachments.saveNotificationAttachments(db, a.id, parsed.items);
 
   const dry = store.bulkDeleteNotifications(db, {
-    level: null, source: null, type: 'bulk-a', unreadOnly: false, readOnly: false
+    level: null, source: 'bulk-a', unreadOnly: false, readOnly: false
   }, true);
   assert.equal(dry, 1);
   assert.ok(store.getNotification(db, a.id), 'dryRun 不应删除');
 
   const deleted = store.bulkDeleteNotifications(db, {
-    level: null, source: null, type: 'bulk-a', unreadOnly: false, readOnly: false
+    level: null, source: 'bulk-a', unreadOnly: false, readOnly: false
   }, false);
   assert.equal(deleted, 1);
   assert.equal(store.getNotification(db, a.id), null);
   assert.equal(fs.existsSync(path.join(FILES_DIR, String(a.id))), false);
-  assert.ok(store.getNotification(db, b.id), '其它类别不受影响');
+  assert.ok(store.getNotification(db, b.id), '其它来源不受影响');
 });
