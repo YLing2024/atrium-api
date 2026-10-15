@@ -132,3 +132,33 @@
 
 - IM（飞书）推送本身、以及把 6 个定时任务 + 秘书任务改为「出图 + 归档 + 推送」的统一发送器；
 - 移动端 Flutter 仓库（已归档，不再改动）。
+
+## 6. 追加需求（2026-10-15 同日，用户澄清）：「归档的是网页，不是网页截图」
+
+用户原话：「归档的是网页，而不是网页截图哦」。即：**通知归档的正文应当是可阅读的真实网页**，
+不是把报告渲染成 PNG 再贴上去；图片可以留作聊天渠道（IM）用，但**归档侧要能当网页看**。
+
+### 6.1 后端（`admin-server`）
+
+1. 附件允许的 `mime` **新增 `text/html`**（其余规则不变：安全化命名、≤8MB/个、≤4 个、合计 ≤20MB）。
+2. **安全（必须做，不可省）**：`GET /api/admin/notifications/:id/files/:name` 在返回 `text/html` 时，
+   必须额外下发 `Content-Security-Policy: sandbox`（不带 `allow-scripts` / `allow-same-origin`），
+   且保持 `Content-Disposition: inline` 与 `X-Content-Type-Options: nosniff`。
+   理由：通知正文由本机脚本产出（报告 HTML 无 JS），管理端是同源最敏感应用，**绝不能**让归档 HTML 以同源身份执行脚本。
+3. 单测补两条：`text/html` 允许写入并落盘；下载 `text/html` 时响应头含 `Content-Security-Policy: sandbox`。
+4. 不改动其它既有行为（图片附件路径、列表字段、保留期清理一律照旧）。
+
+### 6.2 前端（`admin-web`）
+
+1. `NotificationCenter.tsx` 阅读区：附件里存在 `text/html` 时，正文下方先渲染**内嵌网页**——
+   `<iframe src={url} sandbox="" title={name} />`（`width:100%`、`height: min(70vh, 900px)`、无边框、白底、随主题给一层浅描边），
+   下方再给一行「在新标签打开」（`<a href={url} target="_blank" rel="noopener noreferrer">`）。
+2. 图片附件行为**保持不变**（`antd Image`，可点开放大）；`hasImage` 标记规则不变；前端按 `mime` 判断 HTML 附件即可。
+3. 约束照旧：不改 `notificationStream` / `MarkdownBody` / SSE / 鉴权 / 公开页；不新增依赖；禁 emoji；antd 默认 token；
+   `BUILD_OUT_DIR=/tmp/admin-web-verify npx vite build --emptyOutDir` 验证构建；`npm run check` 必须过。
+
+### 6.3 验收
+
+1. 用一条带 `text/html` 附件的通知：`GET /:id` 能看到该附件；下载时响应头含 CSP `sandbox`。
+2. 通知页展开该条 → 内嵌区域显示完整报告网页（可滚动、文字可选中），点「在新标签打开」可独立打开。
+3. 既有图片附件的通知显示不受影响。
