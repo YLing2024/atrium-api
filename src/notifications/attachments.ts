@@ -29,6 +29,7 @@ const ATTACHMENT_MAX_FILE_BYTES = 8 * 1024 * 1024; // 单个解码后 ≤ 8 MB
 const ATTACHMENT_MAX_TOTAL_BYTES = 20 * 1024 * 1024; // 合计 ≤ 20 MB
 
 // 允许的 mime 白名单（其它一律 400）。
+// text/html 供「归档报告网页」：正文应是可阅读的真实网页，而不是网页截图。
 const ALLOWED_ATTACHMENT_MIMES = new Set([
   'image/png',
   'image/jpeg',
@@ -36,7 +37,8 @@ const ALLOWED_ATTACHMENT_MIMES = new Set([
   'image/gif',
   'application/pdf',
   'text/markdown',
-  'text/plain'
+  'text/plain',
+  'text/html'
 ]);
 
 export type AttachmentMeta = { name: string; mime: string; size: number };
@@ -220,6 +222,22 @@ function hasImageAttachment(metas: AttachmentMeta[]): boolean {
   return metas.some((m) => m.mime.startsWith('image/'));
 }
 
+// 归档 HTML 报告以同源页面内嵌进管理端，本机脚本产出的报告无 JS。
+// 安全红线：绝不能让归档 HTML 以同源身份执行脚本——CSP 只给 `sandbox`
+// （不带 allow-scripts / allow-same-origin），并配 nosniff 禁止 MIME 嗅探。
+const HTML_ATTACHMENT_DOWNLOAD_HEADERS: Record<string, string> = {
+  'Content-Security-Policy': 'sandbox',
+  'X-Content-Type-Options': 'nosniff'
+};
+
+/**
+ * 附件下载的额外响应头：仅 `text/html` 附加 CSP `sandbox` + `nosniff`。
+ * 其它 mime 返回空对象，保持既有下载行为不变。
+ */
+function attachmentDownloadHeaders(mime: string): Record<string, string> {
+  return mime === 'text/html' ? { ...HTML_ATTACHMENT_DOWNLOAD_HEADERS } : {};
+}
+
 // 解码 URI（express 已解一层，兼容双重编码）；失败保留原值
 function safeDecode(raw: string): string {
   try {
@@ -287,6 +305,7 @@ module.exports = {
   attachmentUrl,
   toAttachmentViews,
   hasImageAttachment,
+  attachmentDownloadHeaders,
   findAttachment,
   deleteNotificationAttachments
 };

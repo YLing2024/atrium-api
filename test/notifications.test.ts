@@ -110,6 +110,29 @@ test('saveNotificationAttachments：落盘 0600、目录 0700、元信息入库'
   );
 });
 
+test('parseAttachments：text/html 允许写入并落盘', () => {
+  const r = writeOne({ title: '网页报告' });
+  const parsed = attachments.parseAttachments([
+    { name: 'report.html', mime: 'text/html', dataBase64: b64(Buffer.from('<h1>报告</h1>')) }
+  ]);
+  assert.equal(parsed.ok, true);
+  const saved = attachments.saveNotificationAttachments(db, r.id, parsed.items);
+  assert.equal(saved.warnings.length, 0);
+  assert.equal(saved.metas[0].mime, 'text/html');
+  assert.ok(fs.existsSync(path.join(FILES_DIR, String(r.id), 'report.html')));
+  assert.equal(attachments.listAttachments(db, r.id)[0].mime, 'text/html');
+});
+
+test('attachmentDownloadHeaders：text/html 附 CSP sandbox + nosniff，其它 mime 不加', () => {
+  const html = attachments.attachmentDownloadHeaders('text/html');
+  assert.equal(html['Content-Security-Policy'], 'sandbox');
+  assert.equal(html['X-Content-Type-Options'], 'nosniff');
+  // 红线：不得放开脚本或同源身份
+  assert.ok(!html['Content-Security-Policy'].includes('allow-scripts'));
+  assert.ok(!html['Content-Security-Policy'].includes('allow-same-origin'));
+  assert.deepEqual(attachments.attachmentDownloadHeaders('image/png'), {});
+});
+
 test('列表带 attachments + hasImage；详情带附件；下载地址正确', () => {
   const r = writeOne({ title: '列表附件' });
   const parsed = attachments.parseAttachments([

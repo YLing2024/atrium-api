@@ -390,7 +390,7 @@
   | `attachments` | array | 否 | — | 最多 4 个；单文件解码后 ≤ 8 MB；合计 ≤ 20 MB；`mime` 白名单（见下） |
 
   `attachments[]` 元素：`{ name: string, mime: string, dataBase64: string }`。
-  - `mime` 白名单：`image/png`、`image/jpeg`、`image/webp`、`image/gif`、`application/pdf`、`text/markdown`、`text/plain`。
+  - `mime` 白名单：`image/png`、`image/jpeg`、`image/webp`、`image/gif`、`application/pdf`、`text/markdown`、`text/plain`、`text/html`。`text/html` 供归档「报告网页」——归档的是可阅读的真实网页，而不是网页截图。
   - `name` 服务端安全化：仅取 basename、非法字符替换为 `_`、长度 ≤ 80、去首部 `.`；同一通知内重名自动加 `-2`。
   - 文件落盘 `notification-files/<id>/<safeName>`（目录 0700、文件 0600；根目录可用 `ADMIN_NOTIFICATION_FILES_DIR` 覆盖）。
   - `dataBase64` 绝不进日志/审计；落盘失败不影响通知本身（返回 `attachmentsWarnings`）。
@@ -434,7 +434,7 @@
 - 鉴权：`authRequired`
 - 请求参数：path `id`（number）、`name`（string，落盘文件名，需精确匹配）
 - curl：`curl -sS -H "Authorization: Bearer $TOKEN" "$BASE_URL/api/admin/notifications/1/files/report.png"`
-- 成功 200：附件二进制；`Content-Type` 用入库 mime；`Content-Disposition: inline; filename="…"`；`Cache-Control: private, max-age=3600`
+- 成功 200：附件二进制；`Content-Type` 用入库 mime；`Content-Disposition: inline; filename="…"`；`Cache-Control: private, max-age=3600`；当 mime 为 `text/html` 时额外下发 `Content-Security-Policy: sandbox`（不含 `allow-scripts` / `allow-same-origin`）与 `X-Content-Type-Options: nosniff`，禁止归档网页以同源身份执行脚本
 - 错误：400 无效 id / 空附件名；404 `{ "error": "附件不存在" }`（含防穿越未命中）；503；500 `{ "error": "读取附件失败" }`
 - 副作用：无；幂等：是；限流：无。`name` 先解码 URI、再 `path.basename` 比对并做 `path.resolve` 前缀校验，只允许读 `notification-files/<id>/` 内文件。
 

@@ -56,6 +56,7 @@ const attachments = require('../notifications/attachments.ts') as {
     id: number,
     name: unknown
   ) => { path: string; name: string; mime: string } | null;
+  attachmentDownloadHeaders: (mime: string) => Record<string, string>;
 };
 const { notificationClients, broadcastNotification } = require('../notifications/sse.ts') as {
   notificationClients: Set<import('express').Response>;
@@ -350,6 +351,7 @@ router.get('/api/admin/notifications/:id', authRequired, (req, res) => {
 
 // 附件下载（需鉴权）：只读 notification-files/<id>/ 内的文件，name 精确匹配落盘名。
 // Content-Type 用入库 mime；inline 展示；私有缓存 1 小时。未命中 404，id/name 非法 400。
+// 归档网页（text/html）额外下发 CSP `sandbox` + nosniff，禁止其以同源身份执行脚本。
 router.get('/api/admin/notifications/:id/files/:name', authRequired, (req, res) => {
   const db = openNotificationsDb();
   if (!db) return res.status(503).json({ error: '通知库暂不可用' });
@@ -367,6 +369,9 @@ router.get('/api/admin/notifications/:id/files/:name', authRequired, (req, res) 
   res.setHeader('Content-Type', found.mime);
   res.setHeader('Content-Disposition', `inline; filename="${found.name}"`);
   res.setHeader('Cache-Control', 'private, max-age=3600');
+  for (const [key, value] of Object.entries(attachments.attachmentDownloadHeaders(found.mime))) {
+    res.setHeader(key, value);
+  }
   const stream = fs.createReadStream(found.path);
   stream.on('error', () => {
     if (res.headersSent) res.destroy();
