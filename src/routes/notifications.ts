@@ -10,6 +10,8 @@ import type {} from 'express';
 
 const express = require('express') as typeof import('express');
 
+const fs = require('fs') as typeof import('fs');
+
 const { openNotificationsDb, NOTIFICATION_LEVELS, NOTIFICATIONS_HEARTBEAT_MS } = require('../db.ts') as {
   openNotificationsDb: () => import('node:sqlite').DatabaseSync | null;
   NOTIFICATION_LEVELS: Set<string>;
@@ -23,6 +25,7 @@ const store = require('../notifications/store.ts') as {
   listNotifications: (db: import('node:sqlite').DatabaseSync, f: {
     limit: number; before: number | null; level: string | null; source: string | null; type: string | null; unreadOnly: boolean;
   }) => { items: unknown[]; unread: number; total: number };
+  getNotification: (db: import('node:sqlite').DatabaseSync, id: number) => import('../notifications/store.ts').NotificationItem | null;
   listNotificationTypes: (db: import('node:sqlite').DatabaseSync) => { types: unknown[] };
   updateNotificationType: (db: import('node:sqlite').DatabaseSync, key: string, patch: {
     label?: string; description?: string; defaultLevel?: string | null; sort?: number; enabled?: 0 | 1;
@@ -31,9 +34,28 @@ const store = require('../notifications/store.ts') as {
   markAllNotificationsRead: (db: import('node:sqlite').DatabaseSync) => number;
   deleteNotification: (db: import('node:sqlite').DatabaseSync, id: number) => void;
   bulkDeleteNotifications: (db: import('node:sqlite').DatabaseSync, f: {
-    level: string | null; source: string | null; unreadOnly: boolean; readOnly: boolean;
+    level: string | null; source: string | null; type: string | null; unreadOnly: boolean; readOnly: boolean;
   }, dryRun: boolean) => number;
   notificationStats: (db: import('node:sqlite').DatabaseSync) => { total: number; unread: number; sources: unknown[] };
+};
+const attachments = require('../notifications/attachments.ts') as {
+  parseAttachments: (input: unknown) =>
+    | { ok: true; items: import('../notifications/attachments.ts').PreparedAttachment[] }
+    | { ok: false; status: number; error: string };
+  saveNotificationAttachments: (
+    db: import('node:sqlite').DatabaseSync,
+    id: number,
+    items: import('../notifications/attachments.ts').PreparedAttachment[]
+  ) => { metas: import('../notifications/attachments.ts').AttachmentMeta[]; warnings: string[] };
+  toAttachmentViews: (
+    id: number,
+    metas: import('../notifications/attachments.ts').AttachmentMeta[]
+  ) => import('../notifications/attachments.ts').AttachmentView[];
+  findAttachment: (
+    db: import('node:sqlite').DatabaseSync,
+    id: number,
+    name: unknown
+  ) => { path: string; name: string; mime: string } | null;
 };
 const { notificationClients, broadcastNotification } = require('../notifications/sse.ts') as {
   notificationClients: Set<import('express').Response>;
@@ -51,10 +73,13 @@ const { auditLog, clientIp } = require('../util.ts') as {
 const router = express.Router();
 
 // 写入通知（本机脚本免 SSO；其余来源走 authRequired）。
-// body: { level?, type?, source, title, body?, link?, dedupKey? } → 201 { id, ts }
+// body: { level?, type?, source, title, body?, link?, dedupKey?, attachments? } → 201 { id, ts, attachments }
 // - type 可选；缺省用 source 当类别键（兼容既有写入方）。
 // - type 未注册 → 自动注册（key 当 label、enabled=1）；enabled=0 的类别仍接受写入。
 // - level 缺省 → 用该类别的 default_level，再没有则 normal。
+// - attachments（可选，最多 4 个）：base64 内联附件，安全化命名后落盘 notification-files/<id>/；
+//   校验（mime/大小）在写入前，落盘失败不影响通知本身（201 + attachmentsWarnings）。
+// - dataBase64 绝不进日志/审计。
 router.post('/api/admin/notifications', notificationsWriteAuth, (req, res) => {
   const db = openNotificationsDb();
   if (!db) return res.status(503).json({ error: '通知库暂不可用' });
@@ -74,15 +99,34 @@ router.post('/api/admin/notifications', notificationsWriteAuth, (req, res) => {
   if (!source || !title) {
     return res.status(400).json({ error: 'source 与 title 不能为空' });
   }
+  // 附件校验/解码先于写入：非法请求不应产生通知（也不应落盘）。
+  const parsed = attachments.parseAttachments(b.attachments);
+  if (!parsed.ok) return res.status(parsed.status).json({ error: parsed.error });
   try {
     const r = store.writeNotification(db, { levelInput, source, typeKey, title, body, link, dedupKey });
-    broadcastNotification(r.item);
-    if (r.deduped) {
-      auditLog('notification_write', ip, true, `dedup id=${r.id} level=${r.level} source=${source} type=${typeKey}`);
-    } else {
-      auditLog('notification_write', ip, true, `id=${r.id} level=${r.level} source=${source} type=${typeKey}`);
+    const saved = parsed.items.length
+      ? attachments.saveNotificationAttachments(db, r.id, parsed.items)
+      : { metas: [], warnings: [] };
+    if (saved.warnings.length) {
+      // 只记文件名与错误，不含 dataBase64/正文
+      console.warn(`[admin-server] 通知附件写入部分失败 id=${r.id}: ${saved.warnings.join('; ')}`);
     }
-    return res.status(201).json({ id: r.id, ts: r.ts });
+    // 重新取一次（带附件）再广播，保证 SSE 推送与列表/详情一致
+    const item = store.getNotification(db, r.id) || r.item;
+    broadcastNotification(item);
+    if (r.deduped) {
+      auditLog('notification_write', ip, true, `dedup id=${r.id} level=${r.level} source=${source} type=${typeKey} attachments=${saved.metas.length}`);
+    } else {
+      auditLog('notification_write', ip, true, `id=${r.id} level=${r.level} source=${source} type=${typeKey} attachments=${saved.metas.length}`);
+    }
+    const payload: {
+      id: number;
+      ts: number;
+      attachments: import('../notifications/attachments.ts').AttachmentView[];
+      attachmentsWarnings?: string[];
+    } = { id: r.id, ts: r.ts, attachments: attachments.toAttachmentViews(r.id, saved.metas) };
+    if (saved.warnings.length) payload.attachmentsWarnings = saved.warnings;
+    return res.status(201).json(payload);
   } catch (e: any) {
     auditLog('notification_write', ip, false, e.message);
     return res.status(500).json({ error: '写入通知失败' });
@@ -212,8 +256,9 @@ router.delete('/api/admin/notifications/:id', authRequired, (req, res) => {
 });
 
 // 批量删除（需鉴权）：按筛选一次删除多条。
-// body: { level?, source?, unreadOnly?, readOnly?, dryRun? } → { ok: true, count: N }
+// body: { level?, source?, type?, unreadOnly?, readOnly?, dryRun? } → { ok: true, count: N }
 // dryRun=true 只统计、不删除，供前端二次确认时拿到准确条数（新增可选字段）。
+// type 为类别维度（新增可选字段，供前端按类别筛选批量删除）。
 // 注意：不带任何条件即「全部删除」；审计只记条数与筛选，绝不记 body。
 router.post('/api/admin/notifications/bulk-delete', authRequired, (req, res) => {
   const db = openNotificationsDb();
@@ -221,19 +266,20 @@ router.post('/api/admin/notifications/bulk-delete', authRequired, (req, res) => 
   const b = req.body || {};
   const level = NOTIFICATION_LEVELS.has(String(b.level || '')) ? String(b.level) : null;
   const source = typeof b.source === 'string' && b.source.trim() ? b.source.trim() : null;
+  const type = typeof b.type === 'string' && b.type.trim() ? b.type.trim() : null;
   const unreadOnly = b.unreadOnly === true;
   const readOnly = b.readOnly === true;
   const dryRun = b.dryRun === true;
   // 未读与已读互斥：同时给出时不匹配任何行，避免误删
   if (unreadOnly && readOnly) return res.json({ ok: true, count: 0 });
   try {
-    const count = store.bulkDeleteNotifications(db, { level, source, unreadOnly, readOnly }, dryRun);
+    const count = store.bulkDeleteNotifications(db, { level, source, type, unreadOnly, readOnly }, dryRun);
     if (!dryRun) {
       auditLog(
         'notification_bulk_delete',
         clientIp(req),
         true,
-        `count=${count} level=${level || '-'} source=${source || '-'} unreadOnly=${unreadOnly} readOnly=${readOnly}`
+        `count=${count} level=${level || '-'} source=${source || '-'} type=${type || '-'} unreadOnly=${unreadOnly} readOnly=${readOnly}`
       );
     }
     res.json({ ok: true, count });
@@ -284,6 +330,49 @@ router.get('/api/admin/notifications/stream', authRequired, (req, res) => {
     clearInterval(hb);
     notificationClients.delete(res);
   });
+});
+
+// 单条详情（需鉴权）：命中返回带附件的 item，不存在 404。
+// 注意：本路由必须排在 /types、/stats、/stream 等固定 GET 之后，避免 :id 抢占它们。
+router.get('/api/admin/notifications/:id', authRequired, (req, res) => {
+  const db = openNotificationsDb();
+  if (!db) return res.status(503).json({ error: '通知库暂不可用' });
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isFinite(id)) return res.status(400).json({ error: '无效的 id' });
+  try {
+    const item = store.getNotification(db, id);
+    if (!item) return res.status(404).json({ error: '通知不存在' });
+    res.json({ item });
+  } catch (e: any) {
+    res.status(500).json({ error: '获取通知详情失败' });
+  }
+});
+
+// 附件下载（需鉴权）：只读 notification-files/<id>/ 内的文件，name 精确匹配落盘名。
+// Content-Type 用入库 mime；inline 展示；私有缓存 1 小时。未命中 404，id/name 非法 400。
+router.get('/api/admin/notifications/:id/files/:name', authRequired, (req, res) => {
+  const db = openNotificationsDb();
+  if (!db) return res.status(503).json({ error: '通知库暂不可用' });
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isFinite(id)) return res.status(400).json({ error: '无效的 id' });
+  const rawName = String(req.params.name || '');
+  if (!rawName) return res.status(400).json({ error: '无效的附件名' });
+  let found: { path: string; name: string; mime: string } | null = null;
+  try {
+    found = attachments.findAttachment(db, id, rawName);
+  } catch (e: any) {
+    return res.status(500).json({ error: '读取附件失败' });
+  }
+  if (!found) return res.status(404).json({ error: '附件不存在' });
+  res.setHeader('Content-Type', found.mime);
+  res.setHeader('Content-Disposition', `inline; filename="${found.name}"`);
+  res.setHeader('Cache-Control', 'private, max-age=3600');
+  const stream = fs.createReadStream(found.path);
+  stream.on('error', () => {
+    if (res.headersSent) res.destroy();
+    else res.status(404).json({ error: '附件不存在' });
+  });
+  stream.pipe(res);
 });
 
 module.exports = router;

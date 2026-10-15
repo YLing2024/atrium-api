@@ -38,7 +38,15 @@ const sharesRouter = require('./routes/shares.ts');
 const historyRouter = require('./routes/history.ts');
 
 const app = express();
-app.use(express.json());
+// JSON body 解析：默认上限 100kb；仅通知写入路由放宽到 24mb（承载 base64 附件），不做全局放大。
+const jsonDefault = express.json();
+const jsonLarge = express.json({ limit: '24mb' });
+app.use((req, res, next) => {
+  if (req.method === 'POST' && req.path.replace(/\/+$/, '') === '/api/admin/notifications') {
+    return jsonLarge(req, res, next);
+  }
+  return jsonDefault(req, res, next);
+});
 app.use(express.urlencoded({ extended: true }));
 
 // 挂载顺序与原单文件路由注册顺序保持一致（同名路径不存在跨模块重叠）
