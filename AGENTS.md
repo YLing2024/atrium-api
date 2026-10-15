@@ -86,6 +86,9 @@ npm run check    # typecheck + lint + test（改完代码先跑这个）
 | GET | `/api/admin/services` | ✅ | systemd 服务状态 |
 | GET | `/api/admin/apps` | ✅ | 应用面板：登记表全部应用 + 实时探活（`?refresh=1` 绕过 10s 缓存）；只读 |
 | GET | `/api/public/apps` | 无 | 公开只读应用中心：字段白名单 + 10s 缓存单飞；`?refresh=1` 按来源 IP 限流；`Cache-Control: no-store`；失败 503 |
+| POST | `/api/admin/notifications` | 回环/可写令牌 | 写入通知；body 可选 `attachments`（base64，最多 4 个，落盘 `notification-files/<id>/`）；该路由单独 `express.json({limit:'24mb'})` |
+| GET | `/api/admin/notifications/:id` | ✅ | 通知单条详情（item 含 `attachments` / `hasImage`） |
+| GET | `/api/admin/notifications/:id/files/:name` | ✅ | 通知附件下载（`name` 精确匹配 + 防穿越；`Content-Type` 用入库 mime） |
 | POST | `/api/admin/upload` | ✅ | multipart，字段名 `file`（上限 100MB） |
 | GET | `/api/admin/download?path=` | ✅ | 仅限 `uploads/` 内 |
 | GET | `/api/admin/files?path=` | ✅ | 文件区列目录（`{ path, parent, entries[] }`，目录在前） |
@@ -158,6 +161,8 @@ admin「应用」Tab 的后端：一个**只读**面板，把本机应用集中�
 | `AUTH_CENTER_BASE_URL` | 无默认 | 认证中心基址（转发设备会话 `/api/admin/sessions*` 与 `/api/admin/totp/*` 用）；未配置时相关接口返回 502 |
 | `AUTH_CENTER_INTERNAL_TOKEN_FILE` | `../../auth-server/internal-token` | 认证中心内部令牌文件（`X-Internal-Token`，0600）；只读、不打印、不返回 |
 | `ADMIN_REDIS_PREFIX` | 见代码 | Redis key 前缀（测试实例隔离） |
+| `ADMIN_NOTIFICATION_RETENTION_DAYS` | `180` | 通知保留天数（`cleanupNotifications()` 删除过期通知时连同附件目录一起清理） |
+| `ADMIN_NOTIFICATION_FILES_DIR` | 通知库同级的 `notification-files/` | 通知附件根目录（`notification-files/<id>/`，0700/0600） |
 | `ADMIN_TERM_PW_FILE` | `/root/.hermes/term_password` | 终端口令哈希文件（`sha256$<salt>$<hash>`，600） |
 
 ## 安全红线

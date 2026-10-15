@@ -58,6 +58,13 @@
   - 会话 `id`：**string**（会话 token）；历史会话 `id`：**string**（Hermes 会话 id）。
   - **项目级约定**：博客等模块的**雪花 ID（`public_id`）一律为字符串，禁止转 Number**（会丢精度）；本服务当前无雪花 ID 字段，`/api/blog/*` 由别的后端提供。
 
+### 3.3 通知附件
+
+- 每条通知最多 4 个附件；附件文件本体落盘 `notification-files/<id>/<safeName>`（目录 0700、文件 0600；根目录 `ADMIN_NOTIFICATION_FILES_DIR` 可覆盖），元信息（`name`/`mime`/`size`）入库 `notification_attachments`。
+- `size` 为**解码后字节数**；接口返回的 `attachments[]` 元素形如 `{ name, mime, size, url }`，`url` 为同源相对路径，前端直接使用不要再拼。
+- `hasImage`：该通知是否含 `image/*` 附件。
+- 删除通知（单条/批量/保留期清理）会一并删除附件目录与元信息。
+
 ## 四、系统与进程
 
 ### GET /
@@ -380,11 +387,19 @@
   | `body` | string | 否 | `null` | — |
   | `link` | string | 否 | `null` | — |
   | `dedupKey` | string | 否 | `null` | 相同 key 去重 |
+  | `attachments` | array | 否 | — | 最多 4 个；单文件解码后 ≤ 8 MB；合计 ≤ 20 MB；`mime` 白名单（见下） |
+
+  `attachments[]` 元素：`{ name: string, mime: string, dataBase64: string }`。
+  - `mime` 白名单：`image/png`、`image/jpeg`、`image/webp`、`image/gif`、`application/pdf`、`text/markdown`、`text/plain`。
+  - `name` 服务端安全化：仅取 basename、非法字符替换为 `_`、长度 ≤ 80、去首部 `.`；同一通知内重名自动加 `-2`。
+  - 文件落盘 `notification-files/<id>/<safeName>`（目录 0700、文件 0600；根目录可用 `ADMIN_NOTIFICATION_FILES_DIR` 覆盖）。
+  - `dataBase64` 绝不进日志/审计；落盘失败不影响通知本身（返回 `attachmentsWarnings`）。
 
 - curl：`curl -sS -X POST -H 'Content-Type: application/json' -d '{"source":"deploy","title":"部署完成"}' "$BASE_URL/api/admin/notifications"`（本机直连回环可免鉴权）
-- 成功 201：`{ "id": 1, "ts": <epoch 秒> }`
-- 错误码：400 `level` 非法 / `source`、`title` 空；403 只读令牌写入；503 通知库不可用；500 写入失败
-- 副作用：写通知库、SSE 广播、写审计；幂等：否（`dedupKey` 可去重）；限流：无
+- 成功 201：`{ "id": 1, "ts": <epoch 秒>, "attachments": [ { "name": "report.png", "mime": "image/png", "size": 612345, "url": "/api/admin/notifications/1/files/report.png" } ] }`（无附件时 `attachments: []`；`attachmentsWarnings` 仅在部分附件落盘失败时出现）
+- 错误码：400 `level` 非法 / `source`、`title` 空 / 附件 `mime` 非法 / 附件结构非法；413 附件超限（数量/单文件/合计，`{ "error": "附件过大" }`）；403 只读令牌写入；503 通知库不可用；500 写入失败
+- 副作用：写通知库、SSE 广播（含附件元信息）、写审计（只记 id/级别/来源/类别/附件数量）；幂等：否（`dedupKey` 可去重）；限流：无
+- 备注：本写入路由单独挂 `express.json({ limit: '24mb' })`（承载 base64 附件），其余接口仍为默认 100kb，不做全局放大。
 
 ### GET /api/admin/notifications
 
@@ -401,9 +416,27 @@
   | `unread` | string | 否 | — | `1` 只看未读 |
 
 - curl：`curl -sS -H "Authorization: Bearer $TOKEN" "$BASE_URL/api/admin/notifications?limit=20&unread=1"`
-- 成功 200：`{ "items": [ { "id": 1, "ts": <秒>, "level": "normal", "source": "…", "type": "…", "title": "…", "body": null, "link": null, "readAt": null } ], "unread": 3, "total": 42 }`
+- 成功 200：`{ "items": [ { "id": 1, "ts": <秒>, "level": "normal", "source": "…", "type": "…", "title": "…", "body": null, "link": null, "readAt": null, "attachments": [ { "name": "report.png", "mime": "image/png", "size": 612345, "url": "/api/admin/notifications/1/files/report.png" } ], "hasImage": true } ], "unread": 3, "total": 42 }`（列表只回附件元信息 + url，不回二进制）
 - 错误：503 通知库不可用；500 `{ "error": "获取通知失败" }`
 - 副作用：无；幂等：是；限流：无
+
+### GET /api/admin/notifications/:id
+
+- 鉴权：`authRequired`
+- 请求参数：path `id`（number）
+- curl：`curl -sS -H "Authorization: Bearer $TOKEN" "$BASE_URL/api/admin/notifications/1"`
+- 成功 200：`{ "item": { "id": 1, "ts": <秒>, "level": "normal", "source": "…", "type": "…", "title": "…", "body": "…markdown…", "link": null, "readAt": null, "attachments": [ { "name": "report.png", "mime": "image/png", "size": 612345, "url": "/api/admin/notifications/1/files/report.png" } ], "hasImage": true } }`
+- 错误：400 无效 id；404 `{ "error": "通知不存在" }`；503；500 `{ "error": "获取通知详情失败" }`
+- 副作用：无；幂等：是；限流：无。**注意路由顺序：本路由排在 `/types`、`/stats`、`/stream` 之后。**
+
+### GET /api/admin/notifications/:id/files/:name
+
+- 鉴权：`authRequired`
+- 请求参数：path `id`（number）、`name`（string，落盘文件名，需精确匹配）
+- curl：`curl -sS -H "Authorization: Bearer $TOKEN" "$BASE_URL/api/admin/notifications/1/files/report.png"`
+- 成功 200：附件二进制；`Content-Type` 用入库 mime；`Content-Disposition: inline; filename="…"`；`Cache-Control: private, max-age=3600`
+- 错误：400 无效 id / 空附件名；404 `{ "error": "附件不存在" }`（含防穿越未命中）；503；500 `{ "error": "读取附件失败" }`
+- 副作用：无；幂等：是；限流：无。`name` 先解码 URI、再 `path.basename` 比对并做 `path.resolve` 前缀校验，只允许读 `notification-files/<id>/` 内文件。
 
 ### GET /api/admin/notifications/types
 
@@ -448,16 +481,16 @@
 - curl：`curl -sS -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE_URL/api/admin/notifications/1"`
 - 成功 200：`{ "ok": true }`
 - 错误：400 无效 id；503；500 `{ "error": "删除通知失败" }`
-- 副作用：删通知、写审计；幂等：是；限流：无
+- 副作用：删通知及其附件目录/元信息、写审计；幂等：是；限流：无
 
 ### POST /api/admin/notifications/bulk-delete
 
 - 鉴权：`authRequired`
-- 请求参数（body，全部可选）：`{ level?, source?, unreadOnly?, readOnly?, dryRun? }`；`unreadOnly` 与 `readOnly` 同时为真时不匹配任何行（返回 0）
+- 请求参数（body，全部可选）：`{ level?, source?, type?, unreadOnly?, readOnly?, dryRun? }`；`unreadOnly` 与 `readOnly` 同时为真时不匹配任何行（返回 0）
 - curl：`curl -sS -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"level":"digest","dryRun":true}' "$BASE_URL/api/admin/notifications/bulk-delete"`
 - 成功 200：`{ "ok": true, "count": 5 }`（`dryRun=true` 只统计不删）
 - 错误：503；500 `{ "error": "批量删除失败" }`
-- 副作用：`dryRun=false` 时删库、写审计；幂等：否；限流：无。**不带任何条件即全部删除。**
+- 副作用：`dryRun=false` 时删通知及其附件目录/元信息、写审计；幂等：否；限流：无。**不带任何条件即全部删除。**
 
 ### GET /api/admin/notifications/stats
 
