@@ -125,7 +125,12 @@ function openMetricsDb() {
 
 const NOTIFICATIONS_DB_FILE =
   process.env.ADMIN_NOTIFICATIONS_DB || path.join(__dirname, '..', 'data', 'notifications.db');
-const NOTIFICATIONS_RETENTION_SECONDS = 30 * 24 * 3600; // 保留 30 天（与日志保留策略一致）
+// 保留期：ADMIN_NOTIFICATION_RETENTION_DAYS（天，默认 180）→ 秒；保留既有常量名 NOTIFICATIONS_RETENTION_SECONDS 供 store 复用。
+const NOTIFICATIONS_RETENTION_DAYS = (() => {
+  const raw = parseInt(process.env.ADMIN_NOTIFICATION_RETENTION_DAYS || '', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : 180;
+})();
+const NOTIFICATIONS_RETENTION_SECONDS = NOTIFICATIONS_RETENTION_DAYS * 24 * 3600;
 const NOTIFICATIONS_DEDUP_WINDOW_SECONDS = 10 * 60; // 同一 dedupKey 10 分钟内只保留一条
 const NOTIFICATIONS_HEARTBEAT_MS = 25000; // SSE 心跳 25s（需求区间 20~30s）
 const NOTIFICATION_LEVELS = new Set(['urgent', 'normal', 'digest']);
@@ -184,6 +189,17 @@ function openNotificationsDb() {
       db.exec('UPDATE notifications SET type = source WHERE type IS NULL');
     }
     db.exec('CREATE INDEX IF NOT EXISTS idx_notifications_type ON notifications(type)');
+    // 通知附件元信息：文件本体落盘在 notification-files/<id>/，本表只存 name/mime/size
+    // （列表/详情/下载都要靠它回 mime；删除通知时连同目录一起清理）。
+    db.exec(
+      'CREATE TABLE IF NOT EXISTS notification_attachments (' +
+        'notification_id INTEGER NOT NULL,' +
+        'name TEXT NOT NULL,' +
+        'mime TEXT NOT NULL,' +
+        'size INTEGER NOT NULL,' +
+        'PRIMARY KEY (notification_id, name)' +
+        ')'
+    );
     // 预置类别（仅缺省时插入，绝不覆盖后台已改的 label / 排序 / 停用状态）：
     // watchdog=看门狗、monitor=站点监控、cron=定时播报、hermes=Hermes、admin=管理后台。
     const seedType = db.prepare(
@@ -216,6 +232,7 @@ module.exports = {
   AGG_COLUMNS,
   AGG_COLUMNS_CREATE,
   NOTIFICATIONS_DB_FILE,
+  NOTIFICATIONS_RETENTION_DAYS,
   NOTIFICATIONS_RETENTION_SECONDS,
   NOTIFICATIONS_DEDUP_WINDOW_SECONDS,
   NOTIFICATIONS_HEARTBEAT_MS,

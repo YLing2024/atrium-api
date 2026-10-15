@@ -15,6 +15,19 @@ const { openNotificationsDb, NOTIFICATION_LEVELS, NOTIFICATIONS_RETENTION_SECOND
   NOTIFICATIONS_RETENTION_SECONDS: number;
   NOTIFICATIONS_DEDUP_WINDOW_SECONDS: number;
 };
+const {
+  listAttachments,
+  attachmentsForIds,
+  toAttachmentViews,
+  hasImageAttachment,
+  deleteNotificationAttachments
+} = require('./attachments.ts') as {
+  listAttachments: (db: SqliteDatabase, id: number) => import('./attachments.ts').AttachmentMeta[];
+  attachmentsForIds: (db: SqliteDatabase, ids: number[]) => Map<number, import('./attachments.ts').AttachmentMeta[]>;
+  toAttachmentViews: (id: number, metas: import('./attachments.ts').AttachmentMeta[]) => import('./attachments.ts').AttachmentView[];
+  hasImageAttachment: (metas: import('./attachments.ts').AttachmentMeta[]) => boolean;
+  deleteNotificationAttachments: (db: SqliteDatabase, ids: number[]) => void;
+};
 
 // 通知行（库内原始行，字段名与表结构一致）
 export type NotificationRow = {
@@ -40,13 +53,20 @@ export type NotificationItem = {
   body: string | null;
   link: string | null;
   readAt: number | null;
+  attachments: import('./attachments.ts').AttachmentView[];
+  hasImage: boolean;
 };
 
 // 库内行 → 接口契约 item（字段名严格固定；dedup_key 不外泄）
 // type 为类别维度（可历史缺失，回退 source），source 字段保留不变，既有客户端不受影响。
-function notificationView(row: NotificationRow): NotificationItem {
+// attachments 由调用方按 id 取元信息后传入（列表批量取、详情单条取；写入时为刚落的附件）。
+function notificationView(
+  row: NotificationRow,
+  attachments: import('./attachments.ts').AttachmentMeta[] = []
+): NotificationItem {
+  const id = Number(row.id);
   return {
-    id: Number(row.id),
+    id,
     ts: Number(row.ts),
     level: row.level,
     source: row.source,
@@ -54,7 +74,9 @@ function notificationView(row: NotificationRow): NotificationItem {
     title: row.title,
     body: row.body,
     link: row.link,
-    readAt: row.read_at == null ? null : Number(row.read_at)
+    readAt: row.read_at == null ? null : Number(row.read_at),
+    attachments: toAttachmentViews(id, attachments),
+    hasImage: hasImageAttachment(attachments)
   };
 }
 
@@ -165,12 +187,21 @@ function listNotifications(db: SqliteDatabase, f: ListNotificationFilters) {
     (where.length ? ' WHERE ' + where.join(' AND ') : '') +
     ' ORDER BY id DESC LIMIT ?';
   args.push(f.limit);
-  const items = (db.prepare(sql).all(...args) as NotificationRow[]).map(notificationView);
+  const rows = db.prepare(sql).all(...args) as NotificationRow[];
+  const attMap = attachmentsForIds(db, rows.map((r) => Number(r.id)));
+  const items = rows.map((r) => notificationView(r, attMap.get(Number(r.id)) || []));
   const unread = Number(
     (db.prepare('SELECT COUNT(*) AS n FROM notifications WHERE read_at IS NULL').get() as { n: number }).n
   );
   const total = Number((db.prepare('SELECT COUNT(*) AS n FROM notifications').get() as { n: number }).n);
   return { items, unread, total };
+}
+
+// 单条详情：命中返回带附件的 item，未命中 null。
+function getNotification(db: SqliteDatabase, id: number): NotificationItem | null {
+  const row = db.prepare('SELECT * FROM notifications WHERE id = ?').get(id) as NotificationRow | undefined;
+  if (!row) return null;
+  return notificationView(row, listAttachments(db, id));
 }
 
 // 类别列表：类别由服务端定义，客户端据此动态渲染筛选器（不得内置清单）。
@@ -253,15 +284,18 @@ function markAllNotificationsRead(db: SqliteDatabase): number {
   return Number(info.changes);
 }
 
-// 删除单条
+// 删除单条（连同附件目录与元信息）
 function deleteNotification(db: SqliteDatabase, id: number): void {
+  deleteNotificationAttachments(db, [id]);
   db.prepare('DELETE FROM notifications WHERE id = ?').run(id);
 }
 
-// 批量删除：按筛选统计/删除；未读与已读互斥由调用方保证
+// 批量删除：按筛选统计/删除；未读与已读互斥由调用方保证。
+// type 为类别维度（与 source 并存），供前端「按类别筛选批量删除」使用。
 type BulkDeleteFilters = {
   level: string | null;
   source: string | null;
+  type: string | null;
   unreadOnly: boolean;
   readOnly: boolean;
 };
@@ -277,12 +311,21 @@ function bulkDeleteNotifications(db: SqliteDatabase, f: BulkDeleteFilters, dryRu
     where.push('source = ?');
     args.push(f.source);
   }
+  if (f.type) {
+    where.push('type = ?');
+    args.push(f.type);
+  }
   if (f.unreadOnly) where.push('read_at IS NULL');
   if (f.readOnly) where.push('read_at IS NOT NULL');
   const whereSql = where.length ? ' WHERE ' + where.join(' AND ') : '';
   if (dryRun) {
     return Number((db.prepare('SELECT COUNT(*) AS n FROM notifications' + whereSql).get(...args) as { n: number }).n);
   }
+  // 先查 id（供删附件目录/元信息）→ 删附件 → 删通知行
+  const ids = (db.prepare('SELECT id FROM notifications' + whereSql).all(...args) as { id: number }[]).map((r) =>
+    Number(r.id)
+  );
+  if (ids.length) deleteNotificationAttachments(db, ids);
   const info = db.prepare('DELETE FROM notifications' + whereSql).run(...args);
   return Number(info.changes);
 }
@@ -302,12 +345,18 @@ function notificationStats(db: SqliteDatabase) {
   return { total, unread, sources };
 }
 
-// 清理 30 天前的通知。启动时一次 + 每小时一次；失败只 warn，不影响其它接口。
+// 清理保留期外的通知（天数由 ADMIN_NOTIFICATION_RETENTION_DAYS 控制，默认 180）。
+// 启动时一次 + 每小时一次；删除通知时连同附件目录与元信息一并清理；失败只 warn，不影响其它接口。
 function cleanupNotifications() {
   const db = openNotificationsDb();
   if (!db) return;
   try {
     const cutoff = Math.floor(Date.now() / 1000) - NOTIFICATIONS_RETENTION_SECONDS;
+    // 先查 id（供删附件目录/元信息）→ 删附件 → 删通知行
+    const ids = (db.prepare('SELECT id FROM notifications WHERE ts < ?').all(cutoff) as { id: number }[]).map((r) =>
+      Number(r.id)
+    );
+    if (ids.length) deleteNotificationAttachments(db, ids);
     db.prepare('DELETE FROM notifications WHERE ts < ?').run(cutoff);
   } catch (e: any) {
     console.warn('[admin-server] 通知清理失败（不影响其它接口）:', e.message);
@@ -326,6 +375,7 @@ module.exports = {
   notificationDefaultLevel,
   writeNotification,
   listNotifications,
+  getNotification,
   listNotificationTypes,
   updateNotificationType,
   markNotificationRead,
